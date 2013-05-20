@@ -1,3 +1,8 @@
+:title: Installation on arch linux
+:description: Tutorial for installing on arch linux
+:keywords: docker, installation, arch, binaries
+
+
 .. _arch_linux:
 
 Arch Linux

@@ -1,7 +1,6 @@
-:title: Installation on arch linux
-:description: Tutorial for installing on arch linux
-:keywords: docker, installation, arch, binaries
-
+:title: Installation on Arch Linux
+:description: Docker installation on Arch Linux. 
+:keywords: arch linux, virtualization, docker, documentation, installation
 
 .. _arch_linux:
 

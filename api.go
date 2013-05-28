@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const API_VERSION = 1.0
+const API_VERSION = 1.1
 
 func hijackServer(w http.ResponseWriter) (io.ReadCloser, io.Writer, error) {
 	conn, _, err := w.(http.Hijacker).Hijack()
@@ -48,6 +48,7 @@ func writeJson(w http.ResponseWriter, b []byte) {
 	w.Write(b)
 }
 
+// FIXME: Use stvconv.ParseBool() instead?
 func getBoolParam(value string) (bool, error) {
 	if value == "1" || strings.ToLower(value) == "true" {
 		return true, nil
@@ -290,7 +291,10 @@ func postImagesCreate(srv *Server, version float64, w http.ResponseWriter, r *ht
 
 	if image != "" { //pull
 		registry := r.Form.Get("registry")
-		if err := srv.ImagePull(image, tag, registry, w); err != nil {
+		if version > 1.0 {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		if err := srv.ImagePull(image, tag, registry, w, version > 1.0); err != nil {
 			return err
 		}
 	} else { //import
@@ -485,6 +489,28 @@ func postContainersWait(srv *Server, version float64, w http.ResponseWriter, r *
 	return nil
 }
 
+func postContainersResize(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	if err := parseForm(r); err != nil {
+		return err
+	}
+	height, err := strconv.Atoi(r.Form.Get("h"))
+	if err != nil {
+		return err
+	}
+	width, err := strconv.Atoi(r.Form.Get("w"))
+	if err != nil {
+		return err
+	}
+	if vars == nil {
+		return fmt.Errorf("Missing parameter")
+	}
+	name := vars["name"]
+	if err := srv.ContainerResize(name, height, width); err != nil {
+		return err
+	}
+	return nil
+}
+
 func postContainersAttach(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := parseForm(r); err != nil {
 		return err
@@ -620,6 +646,7 @@ func ListenAndServe(addr string, srv *Server, logging bool) error {
 			"/containers/{name:.*}/start":   postContainersStart,
 			"/containers/{name:.*}/stop":    postContainersStop,
 			"/containers/{name:.*}/wait":    postContainersWait,
+			"/containers/{name:.*}/resize":  postContainersResize,
 			"/containers/{name:.*}/attach":  postContainersAttach,
 		},
 		"DELETE": {

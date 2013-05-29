@@ -2,13 +2,11 @@ package docker
 
 import (
 	"fmt"
-	"github.com/dotcloud/docker/registry"
 	"github.com/dotcloud/docker/utils"
 	"io"
 	"io/ioutil"
 	"net"
 	"os"
-	"os/exec"
 	"os/user"
 	"sync"
 	"testing"
@@ -30,13 +28,6 @@ func nuke(runtime *Runtime) error {
 	}
 	wg.Wait()
 	return os.RemoveAll(runtime.root)
-}
-
-func CopyDirectory(source, dest string) error {
-	if _, err := exec.Command("cp", "-ra", source, dest).Output(); err != nil {
-		return err
-	}
-	return nil
 }
 
 func layerArchive(tarfile string) (io.Reader, error) {
@@ -71,8 +62,7 @@ func init() {
 
 	// Create the "Server"
 	srv := &Server{
-		runtime:  runtime,
-		registry: registry.NewRegistry(runtime.root),
+		runtime: runtime,
 	}
 	// Retrieve the Image
 	if err := srv.ImagePull(unitTestImageName, "", "", os.Stdout, false); err != nil {
@@ -90,7 +80,7 @@ func newTestRuntime() (*Runtime, error) {
 	if err := os.Remove(root); err != nil {
 		return nil, err
 	}
-	if err := CopyDirectory(unitTestStoreBase, root); err != nil {
+	if err := utils.CopyDirectory(unitTestStoreBase, root); err != nil {
 		return nil, err
 	}
 
@@ -347,7 +337,7 @@ func TestRestore(t *testing.T) {
 	if err := os.Remove(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := CopyDirectory(unitTestStoreBase, root); err != nil {
+	if err := utils.CopyDirectory(unitTestStoreBase, root); err != nil {
 		t.Fatal(err)
 	}
 

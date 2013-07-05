@@ -257,7 +257,6 @@ func proxy(listener net.Listener, proto, address string) error {
 		utils.Debugf("Connected to backend, splicing")
 		splice(src, dst)
 	}
-	panic("Unreachable")
 }
 
 func halfSplice(dst, src net.Conn) error {
@@ -302,9 +301,9 @@ func newPortMapper() (*PortMapper, error) {
 
 // Port allocator: Atomatically allocate and release networking ports
 type PortAllocator struct {
+	sync.Mutex
 	inUse    map[int]struct{}
 	fountain chan (int)
-	lock     sync.Mutex
 }
 
 func (alloc *PortAllocator) runFountain() {
@@ -318,9 +317,9 @@ func (alloc *PortAllocator) runFountain() {
 // FIXME: Release can no longer fail, change its prototype to reflect that.
 func (alloc *PortAllocator) Release(port int) error {
 	utils.Debugf("Releasing %d", port)
-	alloc.lock.Lock()
+	alloc.Lock()
 	delete(alloc.inUse, port)
-	alloc.lock.Unlock()
+	alloc.Unlock()
 	return nil
 }
 
@@ -335,8 +334,8 @@ func (alloc *PortAllocator) Acquire(port int) (int, error) {
 		}
 		return -1, fmt.Errorf("Port generator ended unexpectedly")
 	}
-	alloc.lock.Lock()
-	defer alloc.lock.Unlock()
+	alloc.Lock()
+	defer alloc.Unlock()
 	if _, inUse := alloc.inUse[port]; inUse {
 		return -1, fmt.Errorf("Port already in use: %d", port)
 	}
@@ -485,20 +484,38 @@ type Nat struct {
 
 func parseNat(spec string) (*Nat, error) {
 	var nat Nat
-	// If spec starts with ':', external and internal ports must be the same.
-	// This might fail if the requested external port is not available.
-	var sameFrontend bool
-	if spec[0] == ':' {
-		sameFrontend = true
-		spec = spec[1:]
-	}
-	port, err := strconv.ParseUint(spec, 10, 16)
-	if err != nil {
-		return nil, err
-	}
-	nat.Backend = int(port)
-	if sameFrontend {
-		nat.Frontend = nat.Backend
+
+	if strings.Contains(spec, ":") {
+		specParts := strings.Split(spec, ":")
+		if len(specParts) != 2 {
+			return nil, fmt.Errorf("Invalid port format.")
+		}
+		// If spec starts with ':', external and internal ports must be the same.
+		// This might fail if the requested external port is not available.
+		var sameFrontend bool
+		if len(specParts[0]) == 0 {
+			sameFrontend = true
+		} else {
+			front, err := strconv.ParseUint(specParts[0], 10, 16)
+			if err != nil {
+				return nil, err
+			}
+			nat.Frontend = int(front)
+		}
+		back, err := strconv.ParseUint(specParts[1], 10, 16)
+		if err != nil {
+			return nil, err
+		}
+		nat.Backend = int(back)
+		if sameFrontend {
+			nat.Frontend = nat.Backend
+		}
+	} else {
+		port, err := strconv.ParseUint(spec, 10, 16)
+		if err != nil {
+			return nil, err
+		}
+		nat.Backend = int(port)
 	}
 	nat.Proto = "tcp"
 	return &nat, nil

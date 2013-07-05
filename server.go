@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"errors"
 	"fmt"
 	"github.com/dotcloud/docker/auth"
 	"github.com/dotcloud/docker/registry"
@@ -14,6 +15,7 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 func (srv *Server) DockerVersion() APIVersion {
@@ -27,7 +29,7 @@ func (srv *Server) DockerVersion() APIVersion {
 func (srv *Server) ContainerKill(name string) error {
 	if container := srv.runtime.Get(name); container != nil {
 		if err := container.Kill(); err != nil {
-			return fmt.Errorf("Error restarting container %s: %s", name, err.Error())
+			return fmt.Errorf("Error restarting container %s: %s", name, err)
 		}
 	} else {
 		return fmt.Errorf("No such container: %s", name)
@@ -53,8 +55,11 @@ func (srv *Server) ContainerExport(name string, out io.Writer) error {
 }
 
 func (srv *Server) ImagesSearch(term string) ([]APISearch, error) {
-
-	results, err := registry.NewRegistry(srv.runtime.root).SearchRepositories(term)
+	r, err := registry.NewRegistry(srv.runtime.root, nil)
+	if err != nil {
+		return nil, err
+	}
+	results, err := r.SearchRepositories(term)
 	if err != nil {
 		return nil, err
 	}
@@ -63,9 +68,6 @@ func (srv *Server) ImagesSearch(term string) ([]APISearch, error) {
 	for _, repo := range results.Results {
 		var out APISearch
 		out.Description = repo["description"]
-		if len(out.Description) > 45 {
-			out.Description = utils.Trunc(out.Description, 42) + "..."
-		}
 		out.Name = repo["name"]
 		outs = append(outs, out)
 	}
@@ -85,7 +87,7 @@ func (srv *Server) ImageInsert(name, url, path string, out io.Writer, sf *utils.
 	}
 	defer file.Body.Close()
 
-	config, _, err := ParseRun([]string{img.ID, "echo", "insert", url, path}, srv.runtime.capabilities)
+	config, _, _, err := ParseRun([]string{img.ID, "echo", "insert", url, path}, srv.runtime.capabilities)
 	if err != nil {
 		return "", err
 	}
@@ -176,6 +178,8 @@ func (srv *Server) Images(all bool, filter string) ([]APIImages, error) {
 			out.Tag = tag
 			out.ID = image.ID
 			out.Created = image.Created.Unix()
+			out.Size = image.Size
+			out.VirtualSize = image.getParentsSize(0) + image.Size
 			outs = append(outs, out)
 		}
 	}
@@ -185,6 +189,8 @@ func (srv *Server) Images(all bool, filter string) ([]APIImages, error) {
 			var out APIImages
 			out.ID = image.ID
 			out.Created = image.Created.Unix()
+			out.Size = image.Size
+			out.VirtualSize = image.getParentsSize(0) + image.Size
 			outs = append(outs, out)
 		}
 	}
@@ -216,12 +222,24 @@ func (srv *Server) ImageHistory(name string) ([]APIHistory, error) {
 		return nil, err
 	}
 
+	lookupMap := make(map[string][]string)
+	for name, repository := range srv.runtime.repositories.Repositories {
+		for tag, id := range repository {
+			// If the ID already has a reverse lookup, do not update it unless for "latest"
+			if _, exists := lookupMap[id]; !exists {
+				lookupMap[id] = []string{}
+			}
+			lookupMap[id] = append(lookupMap[id], name+":"+tag)
+		}
+	}
+
 	outs := []APIHistory{} //produce [] when empty instead of 'null'
 	err = image.WalkHistory(func(img *Image) error {
 		var out APIHistory
 		out.ID = srv.runtime.repositories.ImageName(img.ShortID())
 		out.Created = img.Created.Unix()
 		out.CreatedBy = strings.Join(img.ContainerConfig.Cmd, " ")
+		out.Tags = lookupMap[img.ID]
 		outs = append(outs, out)
 		return nil
 	})
@@ -236,7 +254,7 @@ func (srv *Server) ContainerChanges(name string) ([]Change, error) {
 	return nil, fmt.Errorf("No such container: %s", name)
 }
 
-func (srv *Server) Containers(all bool, n int, since, before string) []APIContainers {
+func (srv *Server) Containers(all, size bool, n int, since, before string) []APIContainers {
 	var foundBefore bool
 	var displayed int
 	retContainers := []APIContainers{}
@@ -270,6 +288,9 @@ func (srv *Server) Containers(all bool, n int, since, before string) []APIContai
 		c.Created = container.Created.Unix()
 		c.Status = container.State.String()
 		c.Ports = container.NetworkSettings.PortMappingHuman()
+		if size {
+			c.SizeRw, c.SizeRootFs = container.GetSize()
+		}
 		retContainers = append(retContainers, c)
 	}
 	return retContainers
@@ -294,8 +315,8 @@ func (srv *Server) ContainerTag(name, repo, tag string, force bool) error {
 	return nil
 }
 
-func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgId, endpoint string, token []string, sf *utils.StreamFormatter) error {
-	history, err := r.GetRemoteHistory(imgId, endpoint, token)
+func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoint string, token []string, sf *utils.StreamFormatter) error {
+	history, err := r.GetRemoteHistory(imgID, endpoint, token)
 	if err != nil {
 		return err
 	}
@@ -305,7 +326,7 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgId, endpoin
 	for _, id := range history {
 		if !srv.runtime.graph.Exists(id) {
 			out.Write(sf.FormatStatus("Pulling %s metadata", id))
-			imgJSON, err := r.GetRemoteImageJSON(id, endpoint, token)
+			imgJSON, imgSize, err := r.GetRemoteImageJSON(id, endpoint, token)
 			if err != nil {
 				// FIXME: Keep goging in case of error?
 				return err
@@ -317,12 +338,12 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgId, endpoin
 
 			// Get the layer
 			out.Write(sf.FormatStatus("Pulling %s fs layer", id))
-			layer, contentLength, err := r.GetRemoteImageLayer(img.ID, endpoint, token)
+			layer, err := r.GetRemoteImageLayer(img.ID, endpoint, token)
 			if err != nil {
 				return err
 			}
 			defer layer.Close()
-			if err := srv.runtime.graph.Register(utils.ProgressReader(layer, contentLength, out, sf.FormatProgress("Downloading", "%v/%v (%v)"), sf), false, img); err != nil {
+			if err := srv.runtime.graph.Register(utils.ProgressReader(layer, imgSize, out, sf.FormatProgress("Downloading", "%v/%v (%v)"), sf), false, img); err != nil {
 				return err
 			}
 		}
@@ -330,26 +351,49 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgId, endpoin
 	return nil
 }
 
-func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, remote, askedTag string, sf *utils.StreamFormatter) error {
-	out.Write(sf.FormatStatus("Pulling repository %s from %s", remote, auth.IndexServerAddress()))
-	repoData, err := r.GetRepositoryData(remote)
-	if err != nil {
-		return err
-	}
+func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, local, remote, askedTag, registryEp string, sf *utils.StreamFormatter) error {
+	out.Write(sf.FormatStatus("Pulling repository %s from %s", local, auth.IndexServerAddress()))
 
-	utils.Debugf("Updating checksums")
-	// Reload the json file to make sure not to overwrite faster sums
-	if err := srv.runtime.graph.UpdateChecksums(repoData.ImgList); err != nil {
-		return err
+	var repoData *registry.RepositoryData
+	var err error
+	if registryEp == "" {
+		repoData, err = r.GetRepositoryData(remote)
+		if err != nil {
+			return err
+		}
+
+		utils.Debugf("Updating checksums")
+		// Reload the json file to make sure not to overwrite faster sums
+		if err := srv.runtime.graph.UpdateChecksums(repoData.ImgList); err != nil {
+			return err
+		}
+	} else {
+		repoData = &registry.RepositoryData{
+			Tokens:    []string{},
+			ImgList:   make(map[string]*registry.ImgData),
+			Endpoints: []string{registryEp},
+		}
 	}
 
 	utils.Debugf("Retrieving the tag list")
 	tagsList, err := r.GetRemoteTags(repoData.Endpoints, remote, repoData.Tokens)
 	if err != nil {
+		utils.Debugf("%v", err)
 		return err
 	}
+
+	if registryEp != "" {
+		for tag, id := range tagsList {
+			repoData.ImgList[id] = &registry.ImgData{
+				ID:       id,
+				Tag:      tag,
+				Checksum: "",
+			}
+		}
+	}
+
 	utils.Debugf("Registering tags")
-	// If not specific tag have been asked, take all
+	// If no tag has been specified, pull them all
 	if askedTag == "" {
 		for tag, id := range tagsList {
 			repoData.ImgList[id].Tag = tag
@@ -358,7 +402,7 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, remote, a
 		// Otherwise, check that the tag exists and use only that one
 		id, exists := tagsList[askedTag]
 		if !exists {
-			return fmt.Errorf("Tag %s not found in repositoy %s", askedTag, remote)
+			return fmt.Errorf("Tag %s not found in repository %s", askedTag, local)
 		}
 		repoData.ImgList[id].Tag = askedTag
 	}
@@ -368,10 +412,18 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, remote, a
 			utils.Debugf("(%s) does not match %s (id: %s), skipping", img.Tag, askedTag, img.ID)
 			continue
 		}
+
+		if img.Tag == "" {
+			utils.Debugf("Image (id: %s) present in this repository but untagged, skipping", img.ID)
+			continue
+		}
 		out.Write(sf.FormatStatus("Pulling image %s (%s) from %s", img.ID, img.Tag, remote))
 		success := false
 		for _, ep := range repoData.Endpoints {
-			if err := srv.pullImage(r, out, img.ID, "https://"+ep+"/v1", repoData.Tokens, sf); err != nil {
+			if !(strings.HasPrefix(ep, "http://") || strings.HasPrefix(ep, "https://")) {
+				ep = fmt.Sprintf("%s://%s", registry.URLScheme(), ep)
+			}
+			if err := srv.pullImage(r, out, img.ID, ep+"/v1", repoData.Tokens, sf); err != nil {
 				out.Write(sf.FormatStatus("Error while retrieving image for tag: %s (%s); checking next endpoint", askedTag, err))
 				continue
 			}
@@ -386,7 +438,7 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, remote, a
 		if askedTag != "" && tag != askedTag {
 			continue
 		}
-		if err := srv.runtime.repositories.Set(remote, tag, id, true); err != nil {
+		if err := srv.runtime.repositories.Set(local, tag, id, true); err != nil {
 			return err
 		}
 	}
@@ -397,18 +449,62 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, remote, a
 	return nil
 }
 
-func (srv *Server) ImagePull(name, tag, endpoint string, out io.Writer, sf *utils.StreamFormatter) error {
-	r := registry.NewRegistry(srv.runtime.root)
+func (srv *Server) poolAdd(kind, key string) error {
+	srv.Lock()
+	defer srv.Unlock()
+
+	if _, exists := srv.pullingPool[key]; exists {
+		return fmt.Errorf("%s %s is already in progress", key, kind)
+	}
+
+	switch kind {
+	case "pull":
+		srv.pullingPool[key] = struct{}{}
+		break
+	case "push":
+		srv.pushingPool[key] = struct{}{}
+		break
+	default:
+		return fmt.Errorf("Unkown pool type")
+	}
+	return nil
+}
+
+func (srv *Server) poolRemove(kind, key string) error {
+	switch kind {
+	case "pull":
+		delete(srv.pullingPool, key)
+		break
+	case "push":
+		delete(srv.pushingPool, key)
+		break
+	default:
+		return fmt.Errorf("Unkown pool type")
+	}
+	return nil
+}
+func (srv *Server) ImagePull(name, tag, endpoint string, out io.Writer, sf *utils.StreamFormatter, authConfig *auth.AuthConfig) error {
+	r, err := registry.NewRegistry(srv.runtime.root, authConfig)
+	if err != nil {
+		return err
+	}
+	if err := srv.poolAdd("pull", name+":"+tag); err != nil {
+		return err
+	}
+	defer srv.poolRemove("pull", name+":"+tag)
+
+	remote := name
+	parts := strings.Split(name, "/")
+	if len(parts) > 2 {
+		remote = fmt.Sprintf("src/%s", url.QueryEscape(strings.Join(parts, "/")))
+	}
 	out = utils.NewWriteFlusher(out)
-	if endpoint != "" {
+	err = srv.pullRepository(r, out, name, remote, tag, endpoint, sf)
+	if err != nil && endpoint != "" {
 		if err := srv.pullImage(r, out, name, endpoint, nil, sf); err != nil {
 			return err
 		}
 		return nil
-	}
-
-	if err := srv.pullRepository(r, out, name, tag, sf); err != nil {
-		return err
 	}
 
 	return nil
@@ -420,20 +516,20 @@ func (srv *Server) ImagePull(name, tag, endpoint string, out io.Writer, sf *util
 // - Check if the archive exists, if it does not, ask the registry
 // - If the archive does exists, process the checksum from it
 // - If the archive does not exists and not found on registry, process checksum from layer
-func (srv *Server) getChecksum(imageId string) (string, error) {
+func (srv *Server) getChecksum(imageID string) (string, error) {
 	// FIXME: Use in-memory map instead of reading the file each time
 	if sums, err := srv.runtime.graph.getStoredChecksums(); err != nil {
 		return "", err
-	} else if checksum, exists := sums[imageId]; exists {
+	} else if checksum, exists := sums[imageID]; exists {
 		return checksum, nil
 	}
 
-	img, err := srv.runtime.graph.Get(imageId)
+	img, err := srv.runtime.graph.Get(imageID)
 	if err != nil {
 		return "", err
 	}
 
-	if _, err := os.Stat(layerArchivePath(srv.runtime.graph.imageRoot(imageId))); err != nil {
+	if _, err := os.Stat(layerArchivePath(srv.runtime.graph.imageRoot(imageID))); err != nil {
 		if os.IsNotExist(err) {
 			// TODO: Ask the registry for the checksum
 			//       As the archive is not there, it is supposed to come from a pull.
@@ -480,7 +576,7 @@ func (srv *Server) getImageList(localRepo map[string]string) ([]*registry.ImgDat
 	return imgList, nil
 }
 
-func (srv *Server) pushRepository(r *registry.Registry, out io.Writer, name string, localRepo map[string]string, sf *utils.StreamFormatter) error {
+func (srv *Server) pushRepository(r *registry.Registry, out io.Writer, name, registryEp string, localRepo map[string]string, sf *utils.StreamFormatter) error {
 	out = utils.NewWriteFlusher(out)
 	out.Write(sf.FormatStatus("Processing checksums"))
 	imgList, err := srv.getImageList(localRepo)
@@ -488,52 +584,87 @@ func (srv *Server) pushRepository(r *registry.Registry, out io.Writer, name stri
 		return err
 	}
 	out.Write(sf.FormatStatus("Sending image list"))
+	srvName := name
+	parts := strings.Split(name, "/")
+	if len(parts) > 2 {
+		srvName = fmt.Sprintf("src/%s", url.QueryEscape(strings.Join(parts, "/")))
+	}
 
-	repoData, err := r.PushImageJSONIndex(name, imgList, false)
-	if err != nil {
-		return err
+	var repoData *registry.RepositoryData
+	if registryEp == "" {
+		repoData, err = r.PushImageJSONIndex(name, imgList, false, nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		repoData = &registry.RepositoryData{
+			ImgList:   make(map[string]*registry.ImgData),
+			Tokens:    []string{},
+			Endpoints: []string{registryEp},
+		}
+		tagsList, err := r.GetRemoteTags(repoData.Endpoints, name, repoData.Tokens)
+		if err != nil && err.Error() != "Repository not found" {
+			return err
+		} else if err == nil {
+			for tag, id := range tagsList {
+				repoData.ImgList[id] = &registry.ImgData{
+					ID:       id,
+					Tag:      tag,
+					Checksum: "",
+				}
+			}
+		}
 	}
 
 	for _, ep := range repoData.Endpoints {
+		if !(strings.HasPrefix(ep, "http://") || strings.HasPrefix(ep, "https://")) {
+			ep = fmt.Sprintf("%s://%s", registry.URLScheme(), ep)
+		}
 		out.Write(sf.FormatStatus("Pushing repository %s to %s (%d tags)", name, ep, len(localRepo)))
 		// For each image within the repo, push them
 		for _, elem := range imgList {
 			if _, exists := repoData.ImgList[elem.ID]; exists {
 				out.Write(sf.FormatStatus("Image %s already on registry, skipping", name))
 				continue
+			} else if r.LookupRemoteImage(elem.ID, ep, repoData.Tokens) {
+				fmt.Fprintf(out, "Image %s already on registry, skipping\n", name)
+				continue
 			}
 			if err := srv.pushImage(r, out, name, elem.ID, ep, repoData.Tokens, sf); err != nil {
 				// FIXME: Continue on error?
 				return err
 			}
-			out.Write(sf.FormatStatus("Pushing tags for rev [%s] on {%s}", elem.ID, ep+"/users/"+name+"/"+elem.Tag))
-			if err := r.PushRegistryTag(name, elem.ID, elem.Tag, ep, repoData.Tokens); err != nil {
+			out.Write(sf.FormatStatus("Pushing tags for rev [%s] on {%s}", elem.ID, ep+"/repositories/"+srvName+"/tags/"+elem.Tag))
+			if err := r.PushRegistryTag(srvName, elem.ID, elem.Tag, ep, repoData.Tokens); err != nil {
 				return err
 			}
 		}
 	}
 
-	if _, err := r.PushImageJSONIndex(name, imgList, true); err != nil {
-		return err
+	if registryEp == "" {
+		if _, err := r.PushImageJSONIndex(name, imgList, true, repoData.Endpoints); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
-func (srv *Server) pushImage(r *registry.Registry, out io.Writer, remote, imgId, ep string, token []string, sf *utils.StreamFormatter) error {
+func (srv *Server) pushImage(r *registry.Registry, out io.Writer, remote, imgID, ep string, token []string, sf *utils.StreamFormatter) error {
 	out = utils.NewWriteFlusher(out)
-	jsonRaw, err := ioutil.ReadFile(path.Join(srv.runtime.graph.Root, imgId, "json"))
+	jsonRaw, err := ioutil.ReadFile(path.Join(srv.runtime.graph.Root, imgID, "json"))
 	if err != nil {
-		return fmt.Errorf("Error while retreiving the path for {%s}: %s", imgId, err)
+		return fmt.Errorf("Error while retreiving the path for {%s}: %s", imgID, err)
 	}
-	out.Write(sf.FormatStatus("Pushing %s", imgId))
+	out.Write(sf.FormatStatus("Pushing %s", imgID))
 
 	// Make sure we have the image's checksum
-	checksum, err := srv.getChecksum(imgId)
+	checksum, err := srv.getChecksum(imgID)
 	if err != nil {
 		return err
 	}
 	imgData := &registry.ImgData{
-		ID:       imgId,
+		ID:       imgID,
 		Checksum: checksum,
 	}
 
@@ -549,11 +680,11 @@ func (srv *Server) pushImage(r *registry.Registry, out io.Writer, remote, imgId,
 	// Retrieve the tarball to be sent
 	var layerData *TempArchive
 	// If the archive exists, use it
-	file, err := os.Open(layerArchivePath(srv.runtime.graph.imageRoot(imgId)))
+	file, err := os.Open(layerArchivePath(srv.runtime.graph.imageRoot(imgID)))
 	if err != nil {
 		if os.IsNotExist(err) {
 			// If the archive does not exist, create one from the layer
-			layerData, err = srv.runtime.graph.TempLayerArchive(imgId, Xz, out)
+			layerData, err = srv.runtime.graph.TempLayerArchive(imgID, Xz, out)
 			if err != nil {
 				return fmt.Errorf("Failed to generate layer archive: %s", err)
 			}
@@ -579,16 +710,25 @@ func (srv *Server) pushImage(r *registry.Registry, out io.Writer, remote, imgId,
 	return nil
 }
 
-func (srv *Server) ImagePush(name, endpoint string, out io.Writer, sf *utils.StreamFormatter) error {
+// FIXME: Allow to interupt current push when new push of same image is done.
+func (srv *Server) ImagePush(name, endpoint string, out io.Writer, sf *utils.StreamFormatter, authConfig *auth.AuthConfig) error {
+	if err := srv.poolAdd("push", name); err != nil {
+		return err
+	}
+	defer srv.poolRemove("push", name)
+
 	out = utils.NewWriteFlusher(out)
 	img, err := srv.runtime.graph.Get(name)
-	r := registry.NewRegistry(srv.runtime.root)
+	r, err2 := registry.NewRegistry(srv.runtime.root, authConfig)
+	if err2 != nil {
+		return err2
+	}
 
 	if err != nil {
 		out.Write(sf.FormatStatus("The push refers to a repository [%s] (len: %d)", name, len(srv.runtime.repositories.Repositories[name])))
 		// If it fails, try to get the repository
 		if localRepo, exists := srv.runtime.repositories.Repositories[name]; exists {
-			if err := srv.pushRepository(r, out, name, localRepo, sf); err != nil {
+			if err := srv.pushRepository(r, out, name, endpoint, localRepo, sf); err != nil {
 				return err
 			}
 			return nil
@@ -644,6 +784,10 @@ func (srv *Server) ImageImport(src, repo, tag string, in io.Reader, out io.Write
 
 func (srv *Server) ContainerCreate(config *Config) (string, error) {
 
+	if config.Memory != 0 && config.Memory < 524288 {
+		return "", fmt.Errorf("Memory limit must be given in bytes (minimum 524288 bytes)")
+	}
+
 	if config.Memory > 0 && !srv.runtime.capabilities.MemoryLimit {
 		config.Memory = 0
 	}
@@ -665,7 +809,7 @@ func (srv *Server) ContainerCreate(config *Config) (string, error) {
 func (srv *Server) ContainerRestart(name string, t int) error {
 	if container := srv.runtime.Get(name); container != nil {
 		if err := container.Restart(t); err != nil {
-			return fmt.Errorf("Error restarting container %s: %s", name, err.Error())
+			return fmt.Errorf("Error restarting container %s: %s", name, err)
 		}
 	} else {
 		return fmt.Errorf("No such container: %s", name)
@@ -675,13 +819,16 @@ func (srv *Server) ContainerRestart(name string, t int) error {
 
 func (srv *Server) ContainerDestroy(name string, removeVolume bool) error {
 	if container := srv.runtime.Get(name); container != nil {
+		if container.State.Running {
+			return fmt.Errorf("Impossible to remove a running container, please stop it first")
+		}
 		volumes := make(map[string]struct{})
 		// Store all the deleted containers volumes
 		for _, volumeId := range container.Volumes {
 			volumes[volumeId] = struct{}{}
 		}
 		if err := srv.runtime.Destroy(container); err != nil {
-			return fmt.Errorf("Error destroying container %s: %s", name, err.Error())
+			return fmt.Errorf("Error destroying container %s: %s", name, err)
 		}
 
 		if removeVolume {
@@ -710,18 +857,113 @@ func (srv *Server) ContainerDestroy(name string, removeVolume bool) error {
 	return nil
 }
 
-func (srv *Server) ImageDelete(name string) error {
-	img, err := srv.runtime.repositories.LookupImage(name)
-	if err != nil {
-		return fmt.Errorf("No such image: %s", name)
+var ErrImageReferenced = errors.New("Image referenced by a repository")
+
+func (srv *Server) deleteImageAndChildren(id string, imgs *[]APIRmi) error {
+	// If the image is referenced by a repo, do not delete
+	if len(srv.runtime.repositories.ByID()[id]) != 0 {
+		return ErrImageReferenced
 	}
-	if err := srv.runtime.graph.Delete(img.ID); err != nil {
-		return fmt.Errorf("Error deleting image %s: %s", name, err.Error())
+
+	// If the image is not referenced but has children, go recursive
+	referenced := false
+	byParents, err := srv.runtime.graph.ByParent()
+	if err != nil {
+		return err
+	}
+	for _, img := range byParents[id] {
+		if err := srv.deleteImageAndChildren(img.ID, imgs); err != nil {
+			if err != ErrImageReferenced {
+				return err
+			}
+			referenced = true
+		}
+	}
+	if referenced {
+		return ErrImageReferenced
+	}
+
+	// If the image is not referenced and has no children, remove it
+	byParents, err = srv.runtime.graph.ByParent()
+	if err != nil {
+		return err
+	}
+	if len(byParents[id]) == 0 {
+		if err := srv.runtime.repositories.DeleteAll(id); err != nil {
+			return err
+		}
+		err := srv.runtime.graph.Delete(id)
+		if err != nil {
+			return err
+		}
+		*imgs = append(*imgs, APIRmi{Deleted: utils.TruncateID(id)})
+		return nil
 	}
 	return nil
 }
 
-func (srv *Server) ImageGetCached(imgId string, config *Config) (*Image, error) {
+func (srv *Server) deleteImageParents(img *Image, imgs *[]APIRmi) error {
+	if img.Parent != "" {
+		parent, err := srv.runtime.graph.Get(img.Parent)
+		if err != nil {
+			return err
+		}
+		// Remove all children images
+		if err := srv.deleteImageAndChildren(img.Parent, imgs); err != nil {
+			return err
+		}
+		return srv.deleteImageParents(parent, imgs)
+	}
+	return nil
+}
+
+func (srv *Server) deleteImage(img *Image, repoName, tag string) ([]APIRmi, error) {
+	//Untag the current image
+	var imgs []APIRmi
+	tagDeleted, err := srv.runtime.repositories.Delete(repoName, tag)
+	if err != nil {
+		return nil, err
+	}
+	if tagDeleted {
+		imgs = append(imgs, APIRmi{Untagged: img.ShortID()})
+	}
+	if len(srv.runtime.repositories.ByID()[img.ID]) == 0 {
+		if err := srv.deleteImageAndChildren(img.ID, &imgs); err != nil {
+			if err != ErrImageReferenced {
+				return imgs, err
+			}
+		} else if err := srv.deleteImageParents(img, &imgs); err != nil {
+			if err != ErrImageReferenced {
+				return imgs, err
+			}
+		}
+	}
+	return imgs, nil
+}
+
+func (srv *Server) ImageDelete(name string, autoPrune bool) ([]APIRmi, error) {
+	img, err := srv.runtime.repositories.LookupImage(name)
+	if err != nil {
+		return nil, fmt.Errorf("No such image: %s", name)
+	}
+	if !autoPrune {
+		if err := srv.runtime.graph.Delete(img.ID); err != nil {
+			return nil, fmt.Errorf("Error deleting image %s: %s", name, err)
+		}
+		return nil, nil
+	}
+
+	var tag string
+	if strings.Contains(name, ":") {
+		nameParts := strings.Split(name, ":")
+		name = nameParts[0]
+		tag = nameParts[1]
+	}
+
+	return srv.deleteImage(img, name, tag)
+}
+
+func (srv *Server) ImageGetCached(imgID string, config *Config) (*Image, error) {
 
 	// Retrieve all images
 	images, err := srv.runtime.graph.All()
@@ -739,7 +981,7 @@ func (srv *Server) ImageGetCached(imgId string, config *Config) (*Image, error) 
 	}
 
 	// Loop on the children of the given image and check the config
-	for elem := range imageMap[imgId] {
+	for elem := range imageMap[imgID] {
 		img, err := srv.runtime.graph.Get(elem)
 		if err != nil {
 			return nil, err
@@ -751,10 +993,10 @@ func (srv *Server) ImageGetCached(imgId string, config *Config) (*Image, error) 
 	return nil, nil
 }
 
-func (srv *Server) ContainerStart(name string) error {
+func (srv *Server) ContainerStart(name string, hostConfig *HostConfig) error {
 	if container := srv.runtime.Get(name); container != nil {
-		if err := container.Start(); err != nil {
-			return fmt.Errorf("Error starting container %s: %s", name, err.Error())
+		if err := container.Start(hostConfig); err != nil {
+			return fmt.Errorf("Error starting container %s: %s", name, err)
 		}
 	} else {
 		return fmt.Errorf("No such container: %s", name)
@@ -765,7 +1007,7 @@ func (srv *Server) ContainerStart(name string) error {
 func (srv *Server) ContainerStop(name string, t int) error {
 	if container := srv.runtime.Get(name); container != nil {
 		if err := container.Stop(t); err != nil {
-			return fmt.Errorf("Error stopping container %s: %s", name, err.Error())
+			return fmt.Errorf("Error stopping container %s: %s", name, err)
 		}
 	} else {
 		return fmt.Errorf("No such container: %s", name)
@@ -797,17 +1039,17 @@ func (srv *Server) ContainerAttach(name string, logs, stream, stdin, stdout, std
 		if stdout {
 			cLog, err := container.ReadLog("stdout")
 			if err != nil {
-				utils.Debugf(err.Error())
+				utils.Debugf("Error reading logs (stdout): %s", err)
 			} else if _, err := io.Copy(out, cLog); err != nil {
-				utils.Debugf(err.Error())
+				utils.Debugf("Error streaming logs (stdout): %s", err)
 			}
 		}
 		if stderr {
 			cLog, err := container.ReadLog("stderr")
 			if err != nil {
-				utils.Debugf(err.Error())
+				utils.Debugf("Error reading logs (stderr): %s", err)
 			} else if _, err := io.Copy(out, cLog); err != nil {
-				utils.Debugf(err.Error())
+				utils.Debugf("Error streaming logs (stderr): %s", err)
 			}
 		}
 	}
@@ -816,9 +1058,6 @@ func (srv *Server) ContainerAttach(name string, logs, stream, stdin, stdout, std
 	if stream {
 		if container.State.Ghost {
 			return fmt.Errorf("Impossible to attach to a ghost container")
-		}
-		if !container.State.Running {
-			return fmt.Errorf("Impossible to attach to a stopped container, start it first")
 		}
 
 		var (
@@ -869,21 +1108,28 @@ func (srv *Server) ImageInspect(name string) (*Image, error) {
 	return nil, fmt.Errorf("No such image: %s", name)
 }
 
-func NewServer(autoRestart bool) (*Server, error) {
+func NewServer(flGraphPath string, autoRestart, enableCors bool, dns ListOpts) (*Server, error) {
 	if runtime.GOARCH != "amd64" {
 		log.Fatalf("The docker runtime currently only supports amd64 (not %s). This will change in the future. Aborting.", runtime.GOARCH)
 	}
-	runtime, err := NewRuntime(autoRestart)
+	runtime, err := NewRuntime(flGraphPath, autoRestart, dns)
 	if err != nil {
 		return nil, err
 	}
 	srv := &Server{
-		runtime: runtime,
+		runtime:     runtime,
+		enableCors:  enableCors,
+		pullingPool: make(map[string]struct{}),
+		pushingPool: make(map[string]struct{}),
 	}
 	runtime.srv = srv
 	return srv, nil
 }
 
 type Server struct {
-	runtime *Runtime
+	sync.Mutex
+	runtime     *Runtime
+	enableCors  bool
+	pullingPool map[string]struct{}
+	pushingPool map[string]struct{}
 }

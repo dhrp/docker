@@ -8,17 +8,23 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/user"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
-const unitTestImageName string = "docker-ut"
+const (
+	unitTestImageName = "docker-unit-tests"
+	unitTestImageID   = "e9aa60c60128cad1"
+	unitTestStoreBase = "/var/lib/docker/unit-tests"
+	testDaemonAddr    = "127.0.0.1:4270"
+	testDaemonProto   = "tcp"
+)
 
-const unitTestStoreBase string = "/var/lib/docker/unit-tests"
+var globalRuntime *Runtime
 
 func nuke(runtime *Runtime) error {
 	var wg sync.WaitGroup
@@ -31,6 +37,23 @@ func nuke(runtime *Runtime) error {
 	}
 	wg.Wait()
 	return os.RemoveAll(runtime.root)
+}
+
+func cleanup(runtime *Runtime) error {
+	for _, container := range runtime.List() {
+		container.Kill()
+		runtime.Destroy(container)
+	}
+	images, err := runtime.graph.All()
+	if err != nil {
+		return err
+	}
+	for _, image := range images {
+		if image.ID != unitTestImageID {
+			runtime.graph.Delete(image.ID)
+		}
+	}
+	return nil
 }
 
 func layerArchive(tarfile string) (io.Reader, error) {
@@ -49,10 +72,8 @@ func init() {
 		return
 	}
 
-	if usr, err := user.Current(); err != nil {
-		panic(err)
-	} else if usr.Uid != "0" {
-		panic("docker tests needs to be run as root")
+	if uid := syscall.Geteuid(); uid != 0 {
+		log.Fatal("docker tests need to be run as root")
 	}
 
 	NetworkBridgeIface = "testdockbr0"
@@ -62,15 +83,28 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+	globalRuntime = runtime
 
 	// Create the "Server"
 	srv := &Server{
-		runtime: runtime,
+		runtime:     runtime,
+		enableCors:  false,
+		pullingPool: make(map[string]struct{}),
+		pushingPool: make(map[string]struct{}),
 	}
 	// Retrieve the Image
-	if err := srv.ImagePull(unitTestImageName, "", "", os.Stdout, utils.NewStreamFormatter(false)); err != nil {
+	if err := srv.ImagePull(unitTestImageName, "", "", os.Stdout, utils.NewStreamFormatter(false), nil); err != nil {
 		panic(err)
 	}
+	// Spawn a Daemon
+	go func() {
+		if err := ListenAndServe(testDaemonProto, testDaemonAddr, srv, os.Getenv("DEBUG") != ""); err != nil {
+			panic(err)
+		}
+	}()
+
+	// Give some time to ListenAndServer to actually start
+	time.Sleep(time.Second)
 }
 
 // FIXME: test that ImagePull(json=true) send correct json output
@@ -99,10 +133,13 @@ func GetTestImage(runtime *Runtime) *Image {
 	imgs, err := runtime.graph.All()
 	if err != nil {
 		panic(err)
-	} else if len(imgs) < 1 {
-		panic("GASP")
 	}
-	return imgs[0]
+	for i := range imgs {
+		if imgs[i].ID == unitTestImageID {
+			return imgs[i]
+		}
+	}
+	panic(fmt.Errorf("Test image %v not found", unitTestImageID))
 }
 
 func TestRuntimeCreate(t *testing.T) {
@@ -291,7 +328,8 @@ func findAvailalblePort(runtime *Runtime, port int) (*Container, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := container.Start(); err != nil {
+	hostConfig := &HostConfig{}
+	if err := container.Start(hostConfig); err != nil {
 		if strings.Contains(err.Error(), "address already in use") {
 			return nil, nil
 		}
@@ -327,13 +365,13 @@ func TestAllocatePortLocalhost(t *testing.T) {
 	defer container.Kill()
 
 	setTimeout(t, "Waiting for the container to be started timed out", 2*time.Second, func() {
-		for {
-			if container.State.Running {
-				break
-			}
+		for !container.State.Running {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+
+	// Even if the state is running, lets give some time to lxc to spawn the process
+	container.WaitTimeout(500 * time.Millisecond)
 
 	conn, err := net.Dial("tcp",
 		fmt.Sprintf(
@@ -401,7 +439,8 @@ func TestRestore(t *testing.T) {
 	defer runtime1.Destroy(container2)
 
 	// Start the container non blocking
-	if err := container2.Start(); err != nil {
+	hostConfig := &HostConfig{}
+	if err := container2.Start(hostConfig); err != nil {
 		t.Fatal(err)
 	}
 

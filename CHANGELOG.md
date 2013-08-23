@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.5.2 (2013-08-08)
+ * Builder: Forbid certain paths within docker build ADD
+ - Runtime: Change network range to avoid conflict with EC2 DNS
+ * API: Change daemon to listen on unix socket by default
+
+## 0.5.1 (2013-07-30)
+ + API: Docker client now sets useragent (RFC 2616)
+ + Runtime: Add `ps` args to `docker top`
+ + Runtime: Add support for container ID files (pidfile like)
+ + Runtime: Add container=lxc in default env
+ + Runtime: Support networkless containers with `docker run -n` and `docker -d -b=none`
+ + API: Add /events endpoint
+ + Builder: ADD command now understands URLs
+ + Builder: CmdAdd and CmdEnv now respect Dockerfile-set ENV variables
+ * Hack: Simplify unit tests with helpers
+ * Hack: Improve docker.upstart event
+ * Hack: Add coverage testing into docker-ci
+ * Runtime: Stdout/stderr logs are now stored in the same file as JSON
+ * Runtime: Allocate a /16 IP range by default, with fallback to /24. Try 12 ranges instead of 3.
+ * Runtime: Change .dockercfg format to json and support multiple auth remote
+ - Runtime: Do not override volumes from config
+ - Runtime: Fix issue with EXPOSE override
+ - Builder: Create directories with 755 instead of 700 within ADD instruction
+
+## 0.5.0 (2013-07-17)
+ + Runtime: List all processes running inside a container with 'docker top'
+ + Runtime: Host directories can be mounted as volumes with 'docker run -v'
+ + Runtime: Containers can expose public UDP ports (eg, '-p 123/udp')
+ + Runtime: Optionally specify an exact public port (eg. '-p 80:4500')
+ + Registry: New image naming scheme inspired by Go packaging convention allows arbitrary combinations of registries
+ + Builder: ENTRYPOINT instruction sets a default binary entry point to a container
+ + Builder: VOLUME instruction marks a part of the container as persistent data
+ * Builder: 'docker build' displays the full output of a build by default
+ * Runtime: 'docker login' supports additional options
+ - Runtime: Dont save a container's hostname when committing an image.
+ - Registry: Fix issues when uploading images to a private registry
+
 ## 0.4.8 (2013-07-01)
  + Builder: New build operation ENTRYPOINT adds an executable entry point to the container.
  - Runtime: Fix a bug which caused 'docker run -d' to no longer print the container ID.

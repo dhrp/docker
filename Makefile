@@ -11,7 +11,7 @@ BUILD_DIR := $(CURDIR)/.gopath
 GOPATH ?= $(BUILD_DIR)
 export GOPATH
 
-GO_OPTIONS ?=
+GO_OPTIONS ?= -a -ldflags='-w -d'
 ifeq ($(VERBOSE), 1)
 GO_OPTIONS += -v
 endif
@@ -49,6 +49,8 @@ whichrelease:
 release: $(BINRELEASE)
 	s3cmd -P put $(BINRELEASE) s3://get.docker.io/builds/`uname -s`/`uname -m`/docker-$(RELEASE_VERSION).tgz
 	s3cmd -P put docker-latest.tgz s3://get.docker.io/builds/`uname -s`/`uname -m`/docker-latest.tgz
+	s3cmd -P put $(SRCRELEASE)/bin/docker s3://get.docker.io/builds/`uname -s`/`uname -m`/docker
+	echo $(RELEASE_VERSION) > latest ; s3cmd -P put latest s3://get.docker.io/latest ; rm latest
 
 srcrelease: $(SRCRELEASE)
 deps: $(DOCKER_DIR)
@@ -64,7 +66,6 @@ $(BINRELEASE): $(SRCRELEASE)
 	rm -f $(BINRELEASE)
 	cd $(SRCRELEASE); make; cp -R bin docker-$(RELEASE_VERSION); tar -f ../$(BINRELEASE) -zv -c docker-$(RELEASE_VERSION)
 	cd $(SRCRELEASE); cp -R bin docker-latest; tar -f ../docker-latest.tgz -zv -c docker-latest
-
 clean:
 	@rm -rf $(dir $(DOCKER_BIN))
 ifeq ($(GOPATH), $(BUILD_DIR))
@@ -79,10 +80,10 @@ test:
 	tar --exclude=${BUILD_SRC} -cz . | tar -xz -C ${BUILD_PATH}
 	GOPATH=${CURDIR}/${BUILD_SRC} go get -d
 	# Do the test
-	sudo -E GOPATH=${CURDIR}/${BUILD_SRC} go test ${GO_OPTIONS}
+	sudo -E GOPATH=${CURDIR}/${BUILD_SRC} CGO_ENABLED=0 go test ${GO_OPTIONS}
 
 testall: all
-	@(cd $(DOCKER_DIR); sudo -E go test ./... $(GO_OPTIONS))
+	@(cd $(DOCKER_DIR); CGO_ENABLED=0 sudo -E go test ./... $(GO_OPTIONS))
 
 fmt:
 	@gofmt -s -l -w .

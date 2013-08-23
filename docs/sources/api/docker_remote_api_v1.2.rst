@@ -1,3 +1,8 @@
+.. use orphan to suppress "WARNING: document isn't included in any toctree"
+.. per http://sphinx-doc.org/markup/misc.html#file-wide-metadata
+
+:orphan:
+
 :title: Remote API v1.2
 :description: API Documentation for Docker
 :keywords: API, Docker, rcli, REST, documentation
@@ -12,7 +17,7 @@ Docker Remote API v1.2
 =====================
 
 - The Remote API is replacing rcli
-- Default port in the docker deamon is 4243 
+- Default port in the docker daemon is 4243
 - The API tends to be REST, but for some complex commands, like attach or pull, the HTTP connection is hijacked to transport stdout stdin and stderr
 
 2. Endpoints
@@ -312,8 +317,8 @@ Start a container
 	:statuscode 500: server error
 
 
-Stop a contaier
-***************
+Stop a container
+****************
 
 .. http:post:: /containers/(id)/stop
 
@@ -865,7 +870,7 @@ Build an image from Dockerfile via stdin
 	   
 	   {{ STREAM }}
 
-	:query t: tag to be applied to the resulting image in case of success
+	:query t: repository name to be applied to the resulting image in case of success
 	:query remote: resource to fetch, as URI
 	:statuscode 200: no error
         :statuscode 500: server error

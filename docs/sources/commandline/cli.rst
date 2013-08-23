@@ -30,6 +30,7 @@ Available Commands
    command/attach
    command/build
    command/commit
+   command/cp
    command/diff
    command/export
    command/history
@@ -52,5 +53,6 @@ Available Commands
    command/start
    command/stop
    command/tag
+   command/top
    command/version
    command/wait

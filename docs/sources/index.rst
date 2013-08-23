@@ -2,8 +2,6 @@
 :description: An overview of the Docker Documentation
 :keywords: containers, lxc, concepts, explanation
 
-.. _introduction:
-
 Welcome
 =======
 
@@ -25,7 +23,7 @@ dependencies.
   commit``).
 
 Each use of ``docker`` is documented here. The features of Docker are
-currently in active development, so this documention will change
+currently in active development, so this documentation will change
 frequently.
 
 For an overview of Docker, please see the `Introduction

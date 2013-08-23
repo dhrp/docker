@@ -15,6 +15,7 @@ Contents:
   attach  <command/attach>
   build   <command/build>
   commit  <command/commit>
+  cp      <command/cp>
   diff    <command/diff>
   export  <command/export>
   history <command/history>
@@ -37,5 +38,6 @@ Contents:
   start   <command/start>
   stop    <command/stop>
   tag     <command/tag>
+  top     <command/top>
   version <command/version>
   wait    <command/wait>

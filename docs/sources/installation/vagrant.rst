@@ -4,6 +4,8 @@
 
 .. _install_using_vagrant:
 
+**Vagrant installation is temporarily out of date, it will be updated for 0.6 soon.**
+
 Using Vagrant (Mac, Linux)
 ==========================
 
@@ -63,7 +65,7 @@ Now you are in the VM, run docker
 
 .. code-block:: bash
 
-   docker
+   sudo docker
 
 
 Continue with the :ref:`hello_world` example.

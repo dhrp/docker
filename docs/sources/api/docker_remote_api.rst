@@ -16,6 +16,7 @@ Docker Remote API
 
 - The Remote API is replacing rcli
 - By default the Docker daemon listens on unix:///var/run/docker.sock and the client must have root access to interact with the daemon
+- If a group named *docker* exists on your system, docker will apply ownership of the socket to the group
 - The API tends to be REST, but for some complex commands, like attach
   or pull, the HTTP connection is hijacked to transport stdout stdin
   and stderr
@@ -47,6 +48,10 @@ What's new
 .. http:get:: /containers/(id)/top
 
    **New!** You can now use ps args with docker top, like `docker top <container_id> aux`
+
+.. http:get:: /events:
+
+   **New!** Image's name added in the events
 
 :doc:`docker_remote_api_v1.3`
 *****************************
@@ -160,7 +165,7 @@ Initial version
 Docker Remote API Client Libraries
 ==================================
 
-These libraries have been not tested by the Docker Maintainers for
+These libraries have not been tested by the Docker Maintainers for
 compatibility. Please file issues with the library owners.  If you
 find more library implementations, please list them in Docker doc bugs
 and we will add the libraries here.

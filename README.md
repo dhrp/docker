@@ -147,7 +147,7 @@ Quick install on Ubuntu 12.04 and 12.10
 ---------------------------------------
 
 ```bash
-curl get.docker.io | sudo sh -x
+curl https://get.docker.io | sudo sh -x
 ```
 
 Binary installs
@@ -166,8 +166,12 @@ supported.
 Installing from source
 ----------------------
 
-1. Make sure you have a [Go language](http://golang.org/doc/install)
-compiler >= 1.1 and [git](http://git-scm.com) installed.
+1. Install Dependencies
+    * [Go language 1.1.x](http://golang.org/doc/install)
+    * [git](http://git-scm.com)
+    * [lxc](http://lxc.sourceforge.net)
+    * [aufs-tools](http://aufs.sourceforge.net)
+
 2. Checkout the source code
 
    ```bash
@@ -301,8 +305,7 @@ Contributing to Docker
 ======================
 
 Want to hack on Docker? Awesome! There are instructions to get you
-started on the website:
-http://docs.docker.io/en/latest/contributing/contributing/
+started [here](CONTRIBUTING.md).
 
 They are probably not perfect, please let us know if anything feels
 wrong or incomplete.

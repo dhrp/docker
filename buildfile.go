@@ -56,7 +56,7 @@ func (b *buildFile) CmdFrom(name string) error {
 	if err != nil {
 		if b.runtime.graph.IsNotExist(err) {
 			remote, tag := utils.ParseRepositoryTag(name)
-			if err := b.srv.ImagePull(remote, tag, b.out, utils.NewStreamFormatter(false), nil, true); err != nil {
+			if err := b.srv.ImagePull(remote, tag, b.out, utils.NewStreamFormatter(false), nil, nil, true); err != nil {
 				return err
 			}
 			image, err = b.runtime.repositories.LookupImage(name)
@@ -197,6 +197,11 @@ func (b *buildFile) CmdExpose(args string) error {
 	return b.commit("", b.config.Cmd, fmt.Sprintf("EXPOSE %v", ports))
 }
 
+func (b *buildFile) CmdUser(args string) error {
+	b.config.User = args
+	return b.commit("", b.config.Cmd, fmt.Sprintf("USER %v", args))
+}
+
 func (b *buildFile) CmdInsert(args string) error {
 	return fmt.Errorf("INSERT has been deprecated. Please use ADD instead")
 }
@@ -220,6 +225,11 @@ func (b *buildFile) CmdEntrypoint(args string) error {
 		return err
 	}
 	return nil
+}
+
+func (b *buildFile) CmdWorkdir(workdir string) error {
+	b.config.WorkingDir = workdir
+	return b.commit("", b.config.Cmd, fmt.Sprintf("WORKDIR %v", workdir))
 }
 
 func (b *buildFile) CmdVolume(args string) error {

@@ -10,8 +10,8 @@ Building an Image with MongoDB
 .. include:: example_header.inc
 
 The goal of this example is to show how you can build your own
-docker images with MongoDB preinstalled. We will do that by
-constructing a Dockerfile that downloads a base image, adds an
+Docker images with MongoDB pre-installed. We will do that by
+constructing a ``Dockerfile`` that downloads a base image, adds an
 apt source and installs the database software on Ubuntu.
 
 Creating a ``Dockerfile``
@@ -24,8 +24,8 @@ Create an empty file called ``Dockerfile``:
     touch Dockerfile
 
 Next, define the parent image you want to use to build your own image on top of.
-Here, we’ll use `CentOS <https://index.docker.io/_/ubuntu/>`_ (tag: ``latest``)
-available on the `docker index`_:
+Here, we’ll use `Ubuntu <https://index.docker.io/_/ubuntu/>`_ (tag: ``latest``)
+available on the `docker index <http://index.docker.io>`_:
 
 .. code-block:: bash
 
@@ -41,7 +41,7 @@ Since we want to be running the latest version of MongoDB we'll need to add the
     RUN echo 'deb http://downloads-distro.mongodb.org/repo/ubuntu-upstart dist 10gen' | tee /etc/apt/sources.list.d/10gen.list
 
 Then, we don't want Ubuntu to complain about init not being available so we'll
-divert /sbin/initctl to /bin/true so it thinks everything is working.
+divert ``/sbin/initctl`` to ``/bin/true`` so it thinks everything is working.
 
 .. code-block:: bash
 
@@ -65,18 +65,20 @@ run without needing to provide a special configuration file)
     # Create the MongoDB data directory
     RUN mkdir -p /data/db
 
-Finally, we'll expose the standard port that MongoDB runs on (27107)
+Finally, we'll expose the standard port that MongoDB runs on, 27107, as well as
+define an ``ENTRYPOINT`` instruction for the container.
 
 .. code-block:: bash
 
     EXPOSE 27017
+    ENTRYPOINT ["usr/bin/mongod"]
 
 Now, lets build the image which will go through the ``Dockerfile`` we made and
 run all of the commands.
 
 .. code-block:: bash
 
-    docker build -t <yourname>/mongodb .
+    sudo docker build -t <yourname>/mongodb .
 
 Now you should be able to run ``mongod`` as a daemon and be able to connect on
 the local port!
@@ -84,13 +86,13 @@ the local port!
 .. code-block:: bash
 
     # Regular style
-    MONGO_ID=$(docker run -d <yourname>/mongodb mongod)
+    MONGO_ID=$(sudo docker run -d <yourname>/mongodb)
 
     # Lean and mean
-    MONGO_ID=$(docker run -d <yourname>/mongodb mongod --noprealloc --smallfiles)
+    MONGO_ID=$(sudo docker run -d <yourname>/mongodb --noprealloc --smallfiles)
 
     # Check the logs out
-    docker logs $MONGO_ID
+    sudo docker logs $MONGO_ID
 
     # Connect and play around
     mongo --port <port you get from `docker ps`>

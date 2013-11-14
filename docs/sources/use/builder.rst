@@ -4,13 +4,13 @@
 
 .. _dockerbuilder:
 
-==================
-Dockerfile Builder
-==================
+======================
+Dockerfiles for Images
+======================
 
 **Docker can act as a builder** and read instructions from a text
-Dockerfile to automate the steps you would otherwise make manually to
-create an image. Executing ``docker build`` will run your steps and
+``Dockerfile`` to automate the steps you would otherwise take manually
+to create an image. Executing ``docker build`` will run your steps and
 commit them along the way, giving you a final image.
 
 .. contents:: Table of Contents
@@ -35,6 +35,8 @@ build succeeds:
 Docker will run your steps one-by-one, committing the result if necessary,
 before finally outputting the ID of your new image.
 
+When you're done with your build, you're ready to look into :ref:`image_push`.
+
 2. Format
 =========
 
@@ -48,12 +50,18 @@ The Dockerfile format is quite simple:
 The Instruction is not case-sensitive, however convention is for them to be
 UPPERCASE in order to distinguish them from arguments more easily.
 
-Docker evaluates the instructions in a Dockerfile in order. **The first
-instruction must be `FROM`** in order to specify the base image from
-which you are building.
+Docker evaluates the instructions in a Dockerfile in order. **The
+first instruction must be `FROM`** in order to specify the
+:ref:`base_image_def` from which you are building.
 
-Docker will ignore **comment lines** *beginning* with ``#``. A comment
-marker anywhere in the rest of the line will be treated as an argument.
+Docker will treat lines that *begin* with ``#`` as a comment. A ``#``
+marker anywhere else in the line will be treated as an argument. This
+allows statements like:
+
+::
+
+    # Comment
+    RUN echo 'we are running some # of cool things'
 
 3. Instructions
 ===============
@@ -66,9 +74,15 @@ building images.
 
     ``FROM <image>``
 
+Or
+
+    ``FROM <image>:<tag>``
+
 The ``FROM`` instruction sets the :ref:`base_image_def` for subsequent
 instructions. As such, a valid Dockerfile must have ``FROM`` as its
-first instruction.
+first instruction. The image can be any valid image -- it is
+especially easy to start by **pulling an image** from the
+:ref:`using_public_repositories`.
 
 ``FROM`` must be the first non-comment instruction in the
 ``Dockerfile``.
@@ -76,6 +90,9 @@ first instruction.
 ``FROM`` can appear multiple times within a single Dockerfile in order
 to create multiple images. Simply make a note of the last image id
 output by the commit before each new ``FROM`` command.
+
+If no ``tag`` is given to the ``FROM`` instruction, ``latest`` is
+assumed. If the used tag does not exist, an error will be returned.
 
 3.2 MAINTAINER
 --------------
@@ -98,6 +115,16 @@ Layering ``RUN`` instructions and generating commits conforms to the
 core concepts of Docker where commits are cheap and containers can be
 created from any point in an image's history, much like source
 control.
+
+Known Issues (RUN)
+..................
+
+* :issue:`783` is about file permissions problems that can occur when
+  using the AUFS file system. You might notice it during an attempt to
+  ``rm`` a file, for example. The issue describes a workaround.
+* :issue:`2424` Locale will not be set automatically.
+
+
 
 3.4 CMD
 -------
@@ -157,10 +184,10 @@ override the default specified in CMD.
 
     ``EXPOSE <port> [<port>...]``
 
-The ``EXPOSE`` instruction sets ports to be publicly exposed when
-running the image. This is functionally equivalent to running ``docker
-commit -run '{"PortSpecs": ["<port>", "<port2>"]}'`` outside the
-builder.
+The ``EXPOSE`` instruction exposes ports for use within links. This is
+functionally equivalent to running ``docker commit -run '{"PortSpecs":
+["<port>", "<port2>"]}'`` outside the builder. Refer to
+:ref:`port_redirection` for detailed information.
 
 3.6 ENV
 -------
@@ -191,8 +218,19 @@ a remote file URL.
 ``<dest>`` is the path at which the source will be copied in the
 destination container.
 
+All new files and directories are created with mode 0755, uid and gid
+0.
+
+.. note::
+   if you build using STDIN (``docker build - < somefile``), there is no build 
+   context, so the Dockerfile cannot contain an ADD statement.
+
 The copy obeys the following rules:
 
+* The ``<src>`` path must be inside the *context* of the build; you cannot 
+  ``ADD ../something /something``, because the first step of a 
+  ``docker build`` is to send the context directory (and subdirectories) to 
+  the docker daemon.
 * If ``<src>`` is a URL and ``<dest>`` does not end with a trailing slash,
   then a file is downloaded from the URL and copied to ``<dest>``.
 * If ``<src>`` is a URL and ``<dest>`` does end with a trailing slash,
@@ -203,8 +241,9 @@ The copy obeys the following rules:
   (``http://example.com`` will not work).
 * If ``<src>`` is a directory, the entire directory is copied,
   including filesystem metadata.
-* If ``<src>``` is a tar archive in a recognized compression format
-  (identity, gzip, bzip2 or xz), it is unpacked as a directory.
+* If ``<src>`` is a *local* tar archive in a recognized compression
+  format (identity, gzip, bzip2 or xz) then it is unpacked as a
+  directory. Resources from *remote* URLs are **not** decompressed.
 
   When a directory is copied or unpacked, it has the same behavior as
   ``tar -x``: the result is the union of
@@ -212,18 +251,17 @@ The copy obeys the following rules:
   1. whatever existed at the destination path and
   2. the contents of the source tree,
 
-  with conflicts resolved in favor of 2) on a file-by-file basis.
+  with conflicts resolved in favor of "2." on a file-by-file basis.
 
 * If ``<src>`` is any other kind of file, it is copied individually
-  along with its metadata. In this case, if ``<dst>`` ends with a
+  along with its metadata. In this case, if ``<dest>`` ends with a
   trailing slash ``/``, it will be considered a directory and the
-  contents of ``<src>`` will be written at ``<dst>/base(<src>)``.
-* If ``<dst>`` does not end with a trailing slash, it will be
+  contents of ``<src>`` will be written at ``<dest>/base(<src>)``.
+* If ``<dest>`` does not end with a trailing slash, it will be
   considered a regular file and the contents of ``<src>`` will be
-  written at ``<dst>``.
+  written at ``<dest>``.
 * If ``<dest>`` doesn't exist, it is created along with all missing
-  directories in its path. All new files and directories are created
-  with mode 0755, uid and gid 0.
+  directories in its path.
 
 .. _entrypoint_def:
 
@@ -310,7 +348,7 @@ the command given by ``CMD`` is executed.
     # VERSION               0.0.1
 
     FROM      ubuntu
-    MAINTAINER Guillaume J. Charmes "guillaume@dotcloud.com"
+    MAINTAINER Guillaume J. Charmes <guillaume@dotcloud.com>
 
     # make sure the package repository is up to date
     RUN echo "deb http://archive.ubuntu.com/ubuntu precise main universe" > /etc/apt/sources.list

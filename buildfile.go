@@ -1,9 +1,9 @@
 package docker
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
+	"github.com/dotcloud/docker/archive"
 	"github.com/dotcloud/docker/utils"
 	"io"
 	"io/ioutil"
@@ -23,7 +23,6 @@ type BuildFile interface {
 
 type buildFile struct {
 	runtime *Runtime
-	builder *Builder
 	srv     *Server
 
 	image        string
@@ -32,6 +31,7 @@ type buildFile struct {
 	context      string
 	verbose      bool
 	utilizeCache bool
+	rm           bool
 
 	tmpContainers map[string]struct{}
 	tmpImages     map[string]struct{}
@@ -39,15 +39,11 @@ type buildFile struct {
 	out io.Writer
 }
 
-func (b *buildFile) clearTmp(containers, images map[string]struct{}) {
+func (b *buildFile) clearTmp(containers map[string]struct{}) {
 	for c := range containers {
 		tmp := b.runtime.Get(c)
 		b.runtime.Destroy(tmp)
-		utils.Debugf("Removing container %s", c)
-	}
-	for i := range images {
-		b.runtime.graph.Delete(i)
-		utils.Debugf("Removing image %s", i)
+		fmt.Fprintf(b.out, "Removing intermediate container %s\n", utils.TruncateID(c))
 	}
 }
 
@@ -69,6 +65,9 @@ func (b *buildFile) CmdFrom(name string) error {
 	}
 	b.image = image.ID
 	b.config = &Config{}
+	if image.Config != nil {
+		b.config = image.Config
+	}
 	if b.config.Env == nil || len(b.config.Env) == 0 {
 		b.config.Env = append(b.config.Env, "HOME=/", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
@@ -293,20 +292,20 @@ func (b *buildFile) addContext(container *Container, orig, dest string) error {
 	}
 	fi, err := os.Stat(origPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: no such file or directory", orig)
 	}
 	if fi.IsDir() {
-		if err := CopyWithTar(origPath, destPath); err != nil {
+		if err := archive.CopyWithTar(origPath, destPath); err != nil {
 			return err
 		}
 		// First try to unpack the source as an archive
-	} else if err := UntarPath(origPath, destPath); err != nil {
+	} else if err := archive.UntarPath(origPath, destPath); err != nil {
 		utils.Debugf("Couldn't untar %s to %s: %s", origPath, destPath, err)
 		// If that fails, just copy it as a regular file
 		if err := os.MkdirAll(path.Dir(destPath), 0755); err != nil {
 			return err
 		}
-		if err := CopyWithTar(origPath, destPath); err != nil {
+		if err := archive.CopyWithTar(origPath, destPath); err != nil {
 			return err
 		}
 	}
@@ -337,7 +336,7 @@ func (b *buildFile) CmdAdd(args string) error {
 
 	b.config.Image = b.image
 	// Create the container and start it
-	container, err := b.builder.Create(b.config)
+	container, _, err := b.runtime.Create(b.config, "")
 	if err != nil {
 		return err
 	}
@@ -372,7 +371,7 @@ func (b *buildFile) run() (string, error) {
 	b.config.Image = b.image
 
 	// Create the container and start it
-	c, err := b.builder.Create(b.config)
+	c, _, err := b.runtime.Create(b.config, "")
 	if err != nil {
 		return "", err
 	}
@@ -383,15 +382,21 @@ func (b *buildFile) run() (string, error) {
 	c.Path = b.config.Cmd[0]
 	c.Args = b.config.Cmd[1:]
 
+	var errCh chan error
+
+	if b.verbose {
+		errCh = utils.Go(func() error {
+			return <-c.Attach(nil, nil, b.out, b.out)
+		})
+	}
+
 	//start the container
-	hostConfig := &HostConfig{}
-	if err := c.Start(hostConfig); err != nil {
+	if err := c.Start(); err != nil {
 		return "", err
 	}
 
-	if b.verbose {
-		err = <-c.Attach(nil, nil, b.out, b.out)
-		if err != nil {
+	if errCh != nil {
+		if err := <-errCh; err != nil {
 			return "", err
 		}
 	}
@@ -428,9 +433,12 @@ func (b *buildFile) commit(id string, autoCmd []string, comment string) error {
 			}
 		}
 
-		container, err := b.builder.Create(b.config)
+		container, warnings, err := b.runtime.Create(b.config, "")
 		if err != nil {
 			return err
+		}
+		for _, warning := range warnings {
+			fmt.Fprintf(b.out, " ---> [Warning] %s\n", warning)
 		}
 		b.tmpContainers[container.ID] = struct{}{}
 		fmt.Fprintf(b.out, " ---> Running in %s\n", utils.TruncateID(container.ID))
@@ -450,7 +458,7 @@ func (b *buildFile) commit(id string, autoCmd []string, comment string) error {
 	autoConfig := *b.config
 	autoConfig.Cmd = autoCmd
 	// Commit the container
-	image, err := b.builder.Commit(container, "", "", "", b.maintainer, &autoConfig)
+	image, err := b.runtime.Commit(container, "", "", "", b.maintainer, &autoConfig)
 	if err != nil {
 		return err
 	}
@@ -459,34 +467,32 @@ func (b *buildFile) commit(id string, autoCmd []string, comment string) error {
 	return nil
 }
 
+// Long lines can be split with a backslash
+var lineContinuation = regexp.MustCompile(`\s*\\\s*\n`)
+
 func (b *buildFile) Build(context io.Reader) (string, error) {
-	// FIXME: @creack any reason for using /tmp instead of ""?
 	// FIXME: @creack "name" is a terrible variable name
-	name, err := ioutil.TempDir("/tmp", "docker-build")
+	name, err := ioutil.TempDir("", "docker-build")
 	if err != nil {
 		return "", err
 	}
-	if err := Untar(context, name); err != nil {
+	if err := archive.Untar(context, name); err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(name)
 	b.context = name
-	dockerfile, err := os.Open(path.Join(name, "Dockerfile"))
-	if err != nil {
+	filename := path.Join(name, "Dockerfile")
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
 		return "", fmt.Errorf("Can't build a directory with no Dockerfile")
 	}
-	// FIXME: "file" is also a terrible variable name ;)
-	file := bufio.NewReader(dockerfile)
+	fileBytes, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	dockerfile := string(fileBytes)
+	dockerfile = lineContinuation.ReplaceAllString(dockerfile, "")
 	stepN := 0
-	for {
-		line, err := file.ReadString('\n')
-		if err != nil {
-			if err == io.EOF && line == "" {
-				break
-			} else if err != io.EOF {
-				return "", err
-			}
-		}
+	for _, line := range strings.Split(dockerfile, "\n") {
 		line = strings.Trim(strings.Replace(line, "\t", " ", -1), " \t\r\n")
 		// Skip comments and empty line
 		if len(line) == 0 || line[0] == '#' {
@@ -517,14 +523,16 @@ func (b *buildFile) Build(context io.Reader) (string, error) {
 	}
 	if b.image != "" {
 		fmt.Fprintf(b.out, "Successfully built %s\n", utils.TruncateID(b.image))
+		if b.rm {
+			b.clearTmp(b.tmpContainers)
+		}
 		return b.image, nil
 	}
 	return "", fmt.Errorf("An error occurred during the build\n")
 }
 
-func NewBuildFile(srv *Server, out io.Writer, verbose, utilizeCache bool) BuildFile {
+func NewBuildFile(srv *Server, out io.Writer, verbose, utilizeCache, rm bool) BuildFile {
 	return &buildFile{
-		builder:       NewBuilder(srv.runtime),
 		runtime:       srv.runtime,
 		srv:           srv,
 		config:        &Config{},
@@ -533,5 +541,6 @@ func NewBuildFile(srv *Server, out io.Writer, verbose, utilizeCache bool) BuildF
 		tmpImages:     make(map[string]struct{}),
 		verbose:       verbose,
 		utilizeCache:  utilizeCache,
+		rm:            rm,
 	}
 }

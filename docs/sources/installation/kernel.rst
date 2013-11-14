@@ -62,14 +62,14 @@ kernel tree to add AUFS. The process is documented on
 Cgroups and namespaces
 ----------------------
 
-You need to enable namespaces and cgroups, to the extend of what is needed
+You need to enable namespaces and cgroups, to the extent of what is needed
 to run LXC containers. Technically, while namespaces have been introduced
 in the early 2.6 kernels, we do not advise to try any kernel before 2.6.32
 to run LXC containers. Note that 2.6.32 has some documented issues regarding
 network namespace setup and teardown; those issues are not a risk if you
 run containers in a private environment, but can lead to denial-of-service
 attacks if you want to run untrusted code in your containers. For more details,
-see `[LP#720095 <https://bugs.launchpad.net/ubuntu/+source/linux/+bug/720095>`_.
+see `LP#720095 <https://bugs.launchpad.net/ubuntu/+source/linux/+bug/720095>`_.
 
 Kernels 2.6.38, and every version since 3.2, have been deployed successfully
 to run containerized production workloads. Feature-wise, there is no huge

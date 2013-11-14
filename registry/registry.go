@@ -22,6 +22,7 @@ import (
 var (
 	ErrAlreadyExists         = errors.New("Image already exists")
 	ErrInvalidRepositoryName = errors.New("Invalid repository name (ex: \"registry.domain.tld/myrepos\")")
+	ErrLoginRequired         = errors.New("Authentication is required.")
 )
 
 func pingRegistryEndpoint(endpoint string) error {
@@ -69,9 +70,9 @@ func validateRepositoryName(repositoryName string) error {
 	if !validNamespace.MatchString(namespace) {
 		return fmt.Errorf("Invalid namespace name (%s), only [a-z0-9_] are allowed, size between 4 and 30", namespace)
 	}
-	validRepo := regexp.MustCompile(`^([a-zA-Z0-9-_.]+)$`)
+	validRepo := regexp.MustCompile(`^([a-z0-9-_.]+)$`)
 	if !validRepo.MatchString(name) {
-		return fmt.Errorf("Invalid repository name (%s), only [a-zA-Z0-9-_.] are allowed", name)
+		return fmt.Errorf("Invalid repository name (%s), only [a-z0-9-_.] are allowed", name)
 	}
 	return nil
 }
@@ -102,17 +103,38 @@ func ResolveRepositoryName(reposName string) (string, string, error) {
 	if err := validateRepositoryName(reposName); err != nil {
 		return "", "", err
 	}
+	endpoint, err := ExpandAndVerifyRegistryUrl(hostname)
+	if err != nil {
+		return "", "", err
+	}
+	return endpoint, reposName, err
+}
+
+// this method expands the registry name as used in the prefix of a repo
+// to a full url. if it already is a url, there will be no change.
+// The registry is pinged to test if it http or https
+func ExpandAndVerifyRegistryUrl(hostname string) (string, error) {
+	if strings.HasPrefix(hostname, "http:") || strings.HasPrefix(hostname, "https:") {
+		// if there is no slash after https:// (8 characters) then we have no path in the url
+		if strings.LastIndex(hostname, "/") < 9 {
+			// there is no path given. Expand with default path
+			hostname = hostname + "/v1/"
+		}
+		if err := pingRegistryEndpoint(hostname); err != nil {
+			return "", errors.New("Invalid Registry endpoint: " + err.Error())
+		}
+		return hostname, nil
+	}
 	endpoint := fmt.Sprintf("https://%s/v1/", hostname)
 	if err := pingRegistryEndpoint(endpoint); err != nil {
 		utils.Debugf("Registry %s does not work (%s), falling back to http", endpoint, err)
 		endpoint = fmt.Sprintf("http://%s/v1/", hostname)
 		if err = pingRegistryEndpoint(endpoint); err != nil {
 			//TODO: triggering highland build can be done there without "failing"
-			return "", "", errors.New("Invalid Registry endpoint: " + err.Error())
+			return "", errors.New("Invalid Registry endpoint: " + err.Error())
 		}
 	}
-	err := validateRepositoryName(reposName)
-	return endpoint, reposName, err
+	return endpoint, nil
 }
 
 func doWithCookies(c *http.Client, req *http.Request) (*http.Response, error) {
@@ -138,13 +160,16 @@ func (r *Registry) GetRemoteHistory(imgID, registry string, token []string) ([]s
 	}
 	req.Header.Set("Authorization", "Token "+strings.Join(token, ", "))
 	res, err := doWithCookies(r.client, req)
-	if err != nil || res.StatusCode != 200 {
-		if res != nil {
-			return nil, utils.NewHTTPRequestError(fmt.Sprintf("Internal server error: %d trying to fetch remote history for %s", res.StatusCode, imgID), res)
-		}
+	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		if res.StatusCode == 401 {
+			return nil, ErrLoginRequired
+		}
+		return nil, utils.NewHTTPRequestError(fmt.Sprintf("Server error: %d trying to fetch remote history for %s", res.StatusCode, imgID), res)
+	}
 
 	jsonString, err := ioutil.ReadAll(res.Body)
 	if err != nil {
@@ -215,6 +240,7 @@ func (r *Registry) GetRemoteImageLayer(imgID, registry string, token []string) (
 		return nil, err
 	}
 	if res.StatusCode != 200 {
+		res.Body.Close()
 		return nil, fmt.Errorf("Server error: Status %d while fetching image layer (%s)",
 			res.StatusCode, imgID)
 	}
@@ -282,7 +308,7 @@ func (r *Registry) GetRepositoryData(indexEp, remote string) (*RepositoryData, e
 	}
 	defer res.Body.Close()
 	if res.StatusCode == 401 {
-		return nil, utils.NewHTTPRequestError(fmt.Sprintf("Please login first (HTTP code %d)", res.StatusCode), res)
+		return nil, ErrLoginRequired
 	}
 	// TODO: Right now we're ignoring checksums in the response body.
 	// In the future, we need to use them to check image validity.
@@ -473,11 +499,12 @@ func (r *Registry) PushImageJSONIndex(indexEp, remote string, imgList []*ImgData
 	}
 	u := fmt.Sprintf("%srepositories/%s/%s", indexEp, remote, suffix)
 	utils.Debugf("[registry] PUT %s", u)
-	utils.Debugf("Image list pushed to index:\n%s\n", imgListJSON)
+	utils.Debugf("Image list pushed to index:\n%s", imgListJSON)
 	req, err := r.reqFactory.NewRequest("PUT", u, bytes.NewReader(imgListJSON))
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Add("Content-type", "application/json")
 	req.SetBasicAuth(r.authConfig.Username, r.authConfig.Password)
 	req.ContentLength = int64(len(imgListJSON))
 	req.Header.Set("X-Docker-Token", "true")
@@ -493,7 +520,7 @@ func (r *Registry) PushImageJSONIndex(indexEp, remote string, imgList []*ImgData
 
 	// Redirect if necessary
 	for res.StatusCode >= 300 && res.StatusCode < 400 {
-		utils.Debugf("Redirected to %s\n", res.Header.Get("Location"))
+		utils.Debugf("Redirected to %s", res.Header.Get("Location"))
 		req, err = r.reqFactory.NewRequest("PUT", res.Header.Get("Location"), bytes.NewReader(imgListJSON))
 		if err != nil {
 			return nil, err
@@ -588,10 +615,18 @@ func (r *Registry) GetAuthConfig(withPasswd bool) *auth.AuthConfig {
 	}
 }
 
+type SearchResult struct {
+	StarCount   int    `json:"star_count"`
+	IsOfficial  bool   `json:"is_official"`
+	Name        string `json:"name"`
+	IsTrusted   bool   `json:"is_trusted"`
+	Description string `json:"description"`
+}
+
 type SearchResults struct {
-	Query      string              `json:"query"`
-	NumResults int                 `json:"num_results"`
-	Results    []map[string]string `json:"results"`
+	Query      string         `json:"query"`
+	NumResults int            `json:"num_results"`
+	Results    []SearchResult `json:"results"`
 }
 
 type RepositoryData struct {

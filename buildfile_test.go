@@ -2,6 +2,7 @@ package docker
 
 import (
 	"fmt"
+	"github.com/dotcloud/docker/archive"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -12,7 +13,7 @@ import (
 
 // mkTestContext generates a build context from the contents of the provided dockerfile.
 // This context is suitable for use as an argument to BuildFile.Build()
-func mkTestContext(dockerfile string, files [][2]string, t *testing.T) Archive {
+func mkTestContext(dockerfile string, files [][2]string, t *testing.T) archive.Archive {
 	context, err := mkBuildContext(dockerfile, files)
 	if err != nil {
 		t.Fatal(err)
@@ -45,6 +46,34 @@ run    [ "$(ls -d /var/run/sshd)" = "/var/run/sshd" ]
 		nil,
 	},
 
+	// Exactly the same as above, except uses a line split with a \ to test
+	// multiline support.
+	{
+		`
+from   {IMAGE}
+run    sh -c 'echo root:testpass \
+	> /tmp/passwd'
+run    mkdir -p /var/run/sshd
+run    [ "$(cat /tmp/passwd)" = "root:testpass" ]
+run    [ "$(ls -d /var/run/sshd)" = "/var/run/sshd" ]
+`,
+		nil,
+		nil,
+	},
+
+	// Line containing literal "\n"
+	{
+		`
+from   {IMAGE}
+run    sh -c 'echo root:testpass > /tmp/passwd'
+run    echo "foo \n bar"; echo "baz"
+run    mkdir -p /var/run/sshd
+run    [ "$(cat /tmp/passwd)" = "root:testpass" ]
+run    [ "$(ls -d /var/run/sshd)" = "/var/run/sshd" ]
+`,
+		nil,
+		nil,
+	},
 	{
 		`
 from {IMAGE}
@@ -201,10 +230,7 @@ func TestBuild(t *testing.T) {
 
 func buildImage(context testContextTemplate, t *testing.T, srv *Server, useCache bool) *Image {
 	if srv == nil {
-		runtime, err := newTestRuntime()
-		if err != nil {
-			t.Fatal(err)
-		}
+		runtime := mkRuntime(t)
 		defer nuke(runtime)
 
 		srv = &Server{
@@ -229,7 +255,7 @@ func buildImage(context testContextTemplate, t *testing.T, srv *Server, useCache
 	ip := srv.runtime.networkManager.bridgeNetwork.IP
 	dockerfile := constructDockerfile(context.dockerfile, ip, port)
 
-	buildfile := NewBuildFile(srv, ioutil.Discard, false, useCache)
+	buildfile := NewBuildFile(srv, ioutil.Discard, false, useCache, false)
 	id, err := buildfile.Build(mkTestContext(dockerfile, context.files, t))
 	if err != nil {
 		t.Fatal(err)
@@ -342,10 +368,7 @@ func TestBuildEntrypoint(t *testing.T) {
 // testing #1405 - config.Cmd does not get cleaned up if
 // utilizing cache
 func TestBuildEntrypointRunCleanup(t *testing.T) {
-	runtime, err := newTestRuntime()
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
 	srv := &Server{
@@ -374,10 +397,7 @@ func TestBuildEntrypointRunCleanup(t *testing.T) {
 }
 
 func TestBuildImageWithCache(t *testing.T) {
-	runtime, err := newTestRuntime()
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
 	srv := &Server{
@@ -405,10 +425,7 @@ func TestBuildImageWithCache(t *testing.T) {
 }
 
 func TestBuildImageWithoutCache(t *testing.T) {
-	runtime, err := newTestRuntime()
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
 	srv := &Server{
@@ -436,10 +453,7 @@ func TestBuildImageWithoutCache(t *testing.T) {
 }
 
 func TestForbiddenContextPath(t *testing.T) {
-	runtime, err := newTestRuntime()
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
 	srv := &Server{
@@ -470,7 +484,7 @@ func TestForbiddenContextPath(t *testing.T) {
 	ip := srv.runtime.networkManager.bridgeNetwork.IP
 	dockerfile := constructDockerfile(context.dockerfile, ip, port)
 
-	buildfile := NewBuildFile(srv, ioutil.Discard, false, true)
+	buildfile := NewBuildFile(srv, ioutil.Discard, false, true, false)
 	_, err = buildfile.Build(mkTestContext(dockerfile, context.files, t))
 
 	if err == nil {
@@ -480,6 +494,84 @@ func TestForbiddenContextPath(t *testing.T) {
 
 	if err.Error() != "Forbidden path: /" {
 		t.Logf("Error message is not expected: %s", err.Error())
+		t.Fail()
+	}
+}
+
+func TestBuildADDFileNotFound(t *testing.T) {
+	runtime := mkRuntime(t)
+	defer nuke(runtime)
+
+	srv := &Server{
+		runtime:     runtime,
+		pullingPool: make(map[string]struct{}),
+		pushingPool: make(map[string]struct{}),
+	}
+
+	context := testContextTemplate{`
+        from {IMAGE}
+        add foo /usr/local/bar
+        `,
+		nil, nil}
+
+	httpServer, err := mkTestingFileServer(context.remoteFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpServer.Close()
+
+	idx := strings.LastIndex(httpServer.URL, ":")
+	if idx < 0 {
+		t.Fatalf("could not get port from test http server address %s", httpServer.URL)
+	}
+	port := httpServer.URL[idx+1:]
+
+	ip := srv.runtime.networkManager.bridgeNetwork.IP
+	dockerfile := constructDockerfile(context.dockerfile, ip, port)
+
+	buildfile := NewBuildFile(srv, ioutil.Discard, false, true, false)
+	_, err = buildfile.Build(mkTestContext(dockerfile, context.files, t))
+
+	if err == nil {
+		t.Log("Error should not be nil")
+		t.Fail()
+	}
+
+	if err.Error() != "foo: no such file or directory" {
+		t.Logf("Error message is not expected: %s", err.Error())
+		t.Fail()
+	}
+}
+
+func TestBuildInheritance(t *testing.T) {
+	runtime := mkRuntime(t)
+	defer nuke(runtime)
+
+	srv := &Server{
+		runtime:     runtime,
+		pullingPool: make(map[string]struct{}),
+		pushingPool: make(map[string]struct{}),
+	}
+
+	img := buildImage(testContextTemplate{`
+            from {IMAGE}
+            expose 4243
+            `,
+		nil, nil}, t, srv, true)
+
+	img2 := buildImage(testContextTemplate{fmt.Sprintf(`
+            from %s
+            entrypoint ["/bin/echo"]
+            `, img.ID),
+		nil, nil}, t, srv, true)
+
+	// from child
+	if img2.Config.Entrypoint[0] != "/bin/echo" {
+		t.Fail()
+	}
+
+	// from parent
+	if img.Config.PortSpecs[0] != "4243" {
 		t.Fail()
 	}
 }

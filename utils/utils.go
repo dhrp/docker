@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,18 +11,40 @@ import (
 	"index/suffixarray"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var (
+	IAMSTATIC bool   // whether or not Docker itself was compiled statically via ./hack/make.sh binary
+	INITSHA1  string // sha1sum of separate static dockerinit, if Docker itself was compiled dynamically via ./hack/make.sh dynbinary
+)
+
+// A common interface to access the Fatal method of
+// both testing.B and testing.T.
+type Fataler interface {
+	Fatal(args ...interface{})
+}
+
+// ListOpts type
+type ListOpts []string
+
+func (opts *ListOpts) String() string {
+	return fmt.Sprint(*opts)
+}
+
+func (opts *ListOpts) Set(value string) error {
+	*opts = append(*opts, value)
+	return nil
+}
 
 // Go is a basic promise implementation: it wraps calls a function in a goroutine,
 // and returns a channel which will later return the function's return value.
@@ -46,22 +69,29 @@ func Download(url string, stderr io.Writer) (*http.Response, error) {
 	return resp, nil
 }
 
+func logf(level string, format string, a ...interface{}) {
+	// Retrieve the stack infos
+	_, file, line, ok := runtime.Caller(2)
+	if !ok {
+		file = "<unknown>"
+		line = -1
+	} else {
+		file = file[strings.LastIndex(file, "/")+1:]
+	}
+
+	fmt.Fprintf(os.Stderr, fmt.Sprintf("[%s] %s:%d %s\n", level, file, line, format), a...)
+}
+
 // Debug function, if the debug flag is set, then display. Do nothing otherwise
 // If Docker is in damon mode, also send the debug info on the socket
 func Debugf(format string, a ...interface{}) {
 	if os.Getenv("DEBUG") != "" {
-
-		// Retrieve the stack infos
-		_, file, line, ok := runtime.Caller(1)
-		if !ok {
-			file = "<unknown>"
-			line = -1
-		} else {
-			file = file[strings.LastIndex(file, "/")+1:]
-		}
-
-		fmt.Fprintf(os.Stderr, fmt.Sprintf("[debug] %s:%d %s\n", file, line, format), a...)
+		logf("debug", format, a...)
 	}
+}
+
+func Errorf(format string, a ...interface{}) {
+	logf("error", format, a...)
 }
 
 // Reader with progress bar
@@ -153,6 +183,40 @@ func HumanSize(size int64) string {
 	return fmt.Sprintf("%.4g %s", sizef, units[i])
 }
 
+// Parses a human-readable string representing an amount of RAM
+// in bytes, kibibytes, mebibytes or gibibytes, and returns the
+// number of bytes, or -1 if the string is unparseable.
+// Units are case-insensitive, and the 'b' suffix is optional.
+func RAMInBytes(size string) (bytes int64, err error) {
+	re, error := regexp.Compile("^(\\d+)([kKmMgG])?[bB]?$")
+	if error != nil {
+		return -1, error
+	}
+
+	matches := re.FindStringSubmatch(size)
+
+	if len(matches) != 3 {
+		return -1, fmt.Errorf("Invalid size: '%s'", size)
+	}
+
+	memLimit, error := strconv.ParseInt(matches[1], 10, 0)
+	if error != nil {
+		return -1, error
+	}
+
+	unit := strings.ToLower(matches[2])
+
+	if unit == "k" {
+		memLimit *= 1024
+	} else if unit == "m" {
+		memLimit *= 1024 * 1024
+	} else if unit == "g" {
+		memLimit *= 1024 * 1024 * 1024
+	}
+
+	return memLimit, nil
+}
+
 func Trunc(s string, maxlen int) string {
 	if len(s) <= maxlen {
 		return s
@@ -171,6 +235,67 @@ func SelfPath() string {
 		panic(err)
 	}
 	return path
+}
+
+func dockerInitSha1(target string) string {
+	f, err := os.Open(target)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha1.New()
+	_, err = io.Copy(h, f)
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func isValidDockerInitPath(target string, selfPath string) bool { // target and selfPath should be absolute (InitPath and SelfPath already do this)
+	if IAMSTATIC {
+		if target == selfPath {
+			return true
+		}
+		targetFileInfo, err := os.Lstat(target)
+		if err != nil {
+			return false
+		}
+		selfPathFileInfo, err := os.Lstat(selfPath)
+		if err != nil {
+			return false
+		}
+		return os.SameFile(targetFileInfo, selfPathFileInfo)
+	}
+	return INITSHA1 != "" && dockerInitSha1(target) == INITSHA1
+}
+
+// Figure out the path of our dockerinit (which may be SelfPath())
+func DockerInitPath() string {
+	selfPath := SelfPath()
+	if isValidDockerInitPath(selfPath, selfPath) {
+		// if we're valid, don't bother checking anything else
+		return selfPath
+	}
+	var possibleInits = []string{
+		filepath.Join(filepath.Dir(selfPath), "dockerinit"),
+		// "/usr/libexec includes internal binaries that are not intended to be executed directly by users or shell scripts. Applications may use a single subdirectory under /usr/libexec."
+		"/usr/libexec/docker/dockerinit",
+		"/usr/local/libexec/docker/dockerinit",
+	}
+	for _, dockerInit := range possibleInits {
+		path, err := exec.LookPath(dockerInit)
+		if err == nil {
+			path, err = filepath.Abs(path)
+			if err != nil {
+				// LookPath already validated that this file exists and is executable (following symlinks), so how could Abs fail?
+				panic(err)
+			}
+			if isValidDockerInitPath(path, selfPath) {
+				return path
+			}
+		}
+	}
+	return ""
 }
 
 type NopWriter struct{}
@@ -293,6 +418,7 @@ func (w *WriteBroadcaster) Write(p []byte) (n int, err error) {
 					continue
 				}
 				lp = append(lp, b...)
+				lp = append(lp, '\n')
 			}
 		}
 		if n, err := sw.wc.Write(lp); err != nil || n != len(lp) {
@@ -319,7 +445,7 @@ func NewWriteBroadcaster() *WriteBroadcaster {
 
 func GetTotalUsedFds() int {
 	if fds, err := ioutil.ReadDir(fmt.Sprintf("/proc/%d/fd", os.Getpid())); err != nil {
-		Debugf("Error opening /proc/%d/fd: %s", os.Getpid(), err)
+		Errorf("Error opening /proc/%d/fd: %s", os.Getpid(), err)
 	} else {
 		return len(fds)
 	}
@@ -515,9 +641,7 @@ func FindCgroupMountpoint(cgroupType string) (string, error) {
 
 func GetKernelVersion() (*KernelVersionInfo, error) {
 	var (
-		flavor               string
-		kernel, major, minor int
-		err                  error
+		err error
 	)
 
 	uts, err := uname()
@@ -536,8 +660,18 @@ func GetKernelVersion() (*KernelVersionInfo, error) {
 	// Remove the \x00 from the release for Atoi to parse correctly
 	release = release[:bytes.IndexByte(release, 0)]
 
-	tmp := strings.SplitN(string(release), "-", 2)
-	tmp2 := strings.SplitN(tmp[0], ".", 3)
+	return ParseRelease(string(release))
+}
+
+func ParseRelease(release string) (*KernelVersionInfo, error) {
+	var (
+		flavor               string
+		kernel, major, minor int
+		err                  error
+	)
+
+	tmp := strings.SplitN(release, "-", 2)
+	tmp2 := strings.Split(tmp[0], ".")
 
 	if len(tmp2) > 0 {
 		kernel, err = strconv.Atoi(tmp2[0])
@@ -600,6 +734,13 @@ func (wf *WriteFlusher) Write(b []byte) (n int, err error) {
 	n, err = wf.w.Write(b)
 	wf.flusher.Flush()
 	return n, err
+}
+
+// Flush the stream immediately.
+func (wf *WriteFlusher) Flush() {
+	wf.Lock()
+	defer wf.Unlock()
+	wf.flusher.Flush()
 }
 
 func NewWriteFlusher(w io.Writer) *WriteFlusher {
@@ -763,7 +904,7 @@ func IsGIT(str string) bool {
 func GetResolvConf() ([]byte, error) {
 	resolv, err := ioutil.ReadFile("/etc/resolv.conf")
 	if err != nil {
-		Debugf("Error openning resolv.conf: %s", err)
+		Errorf("Error openning resolv.conf: %s", err)
 		return nil, err
 	}
 	return resolv, nil
@@ -772,33 +913,73 @@ func GetResolvConf() ([]byte, error) {
 // CheckLocalDns looks into the /etc/resolv.conf,
 // it returns true if there is a local nameserver or if there is no nameserver.
 func CheckLocalDns(resolvConf []byte) bool {
-	if !bytes.Contains(resolvConf, []byte("nameserver")) {
+	var parsedResolvConf = StripComments(resolvConf, []byte("#"))
+	if !bytes.Contains(parsedResolvConf, []byte("nameserver")) {
 		return true
 	}
-
 	for _, ip := range [][]byte{
 		[]byte("127.0.0.1"),
 		[]byte("127.0.1.1"),
 	} {
-		if bytes.Contains(resolvConf, ip) {
+		if bytes.Contains(parsedResolvConf, ip) {
 			return true
 		}
 	}
 	return false
 }
 
-func ParseHost(host string, port int, addr string) string {
-	if strings.HasPrefix(addr, "unix://") {
-		return addr
+// StripComments parses input into lines and strips away comments.
+func StripComments(input []byte, commentMarker []byte) []byte {
+	lines := bytes.Split(input, []byte("\n"))
+	var output []byte
+	for _, currentLine := range lines {
+		var commentIndex = bytes.Index(currentLine, commentMarker)
+		if commentIndex == -1 {
+			output = append(output, currentLine...)
+		} else {
+			output = append(output, currentLine[:commentIndex]...)
+		}
+		output = append(output, []byte("\n")...)
 	}
-	if strings.HasPrefix(addr, "tcp://") {
+	return output
+}
+
+// GetNameserversAsCIDR returns nameservers (if any) listed in
+// /etc/resolv.conf as CIDR blocks (e.g., "1.2.3.4/32")
+// This function's output is intended for net.ParseCIDR
+func GetNameserversAsCIDR(resolvConf []byte) []string {
+	var parsedResolvConf = StripComments(resolvConf, []byte("#"))
+	nameservers := []string{}
+	re := regexp.MustCompile(`^\s*nameserver\s*(([0-9]+\.){3}([0-9]+))\s*$`)
+	for _, line := range bytes.Split(parsedResolvConf, []byte("\n")) {
+		var ns = re.FindSubmatch(line)
+		if len(ns) > 0 {
+			nameservers = append(nameservers, string(ns[1])+"/32")
+		}
+	}
+
+	return nameservers
+}
+
+func ParseHost(host string, port int, addr string) (string, error) {
+	var proto string
+	switch {
+	case strings.HasPrefix(addr, "unix://"):
+		return addr, nil
+	case strings.HasPrefix(addr, "tcp://"):
+		proto = "tcp"
 		addr = strings.TrimPrefix(addr, "tcp://")
+	default:
+		if strings.Contains(addr, "://") {
+			return "", fmt.Errorf("Invalid bind address protocol: %s", addr)
+		}
+		proto = "tcp"
 	}
+
 	if strings.Contains(addr, ":") {
 		hostParts := strings.Split(addr, ":")
 		if len(hostParts) != 2 {
-			log.Fatal("Invalid bind address format.")
-			os.Exit(-1)
+			return "", fmt.Errorf("Invalid bind address format: %s", addr)
 		}
 		if hostParts[0] != "" {
 			host = hostParts[0]
@@ -809,7 +990,7 @@ func ParseHost(host string, port int, addr string) string {
 	} else {
 		host = addr
 	}
-	return fmt.Sprintf("tcp://%s:%d", host, port)
+	return fmt.Sprintf("%s://%s:%d", proto, host, port), nil
 }
 
 func GetReleaseVersion() string {
@@ -842,10 +1023,18 @@ func ParseRepositoryTag(repos string) (string, string) {
 	return repos, ""
 }
 
+type User struct {
+	Uid      string // user id
+	Gid      string // primary group id
+	Username string
+	Name     string
+	HomeDir  string
+}
+
 // UserLookup check if the given username or uid is present in /etc/passwd
 // and returns the user struct.
 // If the username is not found, an error is returned.
-func UserLookup(uid string) (*user.User, error) {
+func UserLookup(uid string) (*User, error) {
 	file, err := ioutil.ReadFile("/etc/passwd")
 	if err != nil {
 		return nil, err
@@ -853,7 +1042,7 @@ func UserLookup(uid string) (*user.User, error) {
 	for _, line := range strings.Split(string(file), "\n") {
 		data := strings.Split(line, ":")
 		if len(data) > 5 && (data[0] == uid || data[2] == uid) {
-			return &user.User{
+			return &User{
 				Uid:      data[2],
 				Gid:      data[3],
 				Username: data[0],
@@ -863,4 +1052,158 @@ func UserLookup(uid string) (*user.User, error) {
 		}
 	}
 	return nil, fmt.Errorf("User not found in /etc/passwd")
+}
+
+type DependencyGraph struct {
+	nodes map[string]*DependencyNode
+}
+
+type DependencyNode struct {
+	id   string
+	deps map[*DependencyNode]bool
+}
+
+func NewDependencyGraph() DependencyGraph {
+	return DependencyGraph{
+		nodes: map[string]*DependencyNode{},
+	}
+}
+
+func (graph *DependencyGraph) addNode(node *DependencyNode) string {
+	if graph.nodes[node.id] == nil {
+		graph.nodes[node.id] = node
+	}
+	return node.id
+}
+
+func (graph *DependencyGraph) NewNode(id string) string {
+	if graph.nodes[id] != nil {
+		return id
+	}
+	nd := &DependencyNode{
+		id:   id,
+		deps: map[*DependencyNode]bool{},
+	}
+	graph.addNode(nd)
+	return id
+}
+
+func (graph *DependencyGraph) AddDependency(node, to string) error {
+	if graph.nodes[node] == nil {
+		return fmt.Errorf("Node %s does not belong to this graph", node)
+	}
+
+	if graph.nodes[to] == nil {
+		return fmt.Errorf("Node %s does not belong to this graph", to)
+	}
+
+	if node == to {
+		return fmt.Errorf("Dependency loops are forbidden!")
+	}
+
+	graph.nodes[node].addDependency(graph.nodes[to])
+	return nil
+}
+
+func (node *DependencyNode) addDependency(to *DependencyNode) bool {
+	node.deps[to] = true
+	return node.deps[to]
+}
+
+func (node *DependencyNode) Degree() int {
+	return len(node.deps)
+}
+
+// The magic happens here ::
+func (graph *DependencyGraph) GenerateTraversalMap() ([][]string, error) {
+	Debugf("Generating traversal map. Nodes: %d", len(graph.nodes))
+	result := [][]string{}
+	processed := map[*DependencyNode]bool{}
+	// As long as we haven't processed all nodes...
+	for len(processed) < len(graph.nodes) {
+		// Use a temporary buffer for processed nodes, otherwise
+		// nodes that depend on each other could end up in the same round.
+		tmp_processed := []*DependencyNode{}
+		for _, node := range graph.nodes {
+			// If the node has more dependencies than what we have cleared,
+			// it won't be valid for this round.
+			if node.Degree() > len(processed) {
+				continue
+			}
+			// If it's already processed, get to the next one
+			if processed[node] {
+				continue
+			}
+			// It's not been processed yet and has 0 deps. Add it!
+			// (this is a shortcut for what we're doing below)
+			if node.Degree() == 0 {
+				tmp_processed = append(tmp_processed, node)
+				continue
+			}
+			// If at least one dep hasn't been processed yet, we can't
+			// add it.
+			ok := true
+			for dep := range node.deps {
+				if !processed[dep] {
+					ok = false
+					break
+				}
+			}
+			// All deps have already been processed. Add it!
+			if ok {
+				tmp_processed = append(tmp_processed, node)
+			}
+		}
+		Debugf("Round %d: found %d available nodes", len(result), len(tmp_processed))
+		// If no progress has been made this round,
+		// that means we have circular dependencies.
+		if len(tmp_processed) == 0 {
+			return nil, fmt.Errorf("Could not find a solution to this dependency graph")
+		}
+		round := []string{}
+		for _, nd := range tmp_processed {
+			round = append(round, nd.id)
+			processed[nd] = true
+		}
+		result = append(result, round)
+	}
+	return result, nil
+}
+
+// An StatusError reports an unsuccessful exit by a command.
+type StatusError struct {
+	Status int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("Status: %d", e.Status)
+}
+
+func IsClosedError(err error) bool {
+	/* This comparison is ugly, but unfortunately, net.go doesn't export errClosing.
+	 * See:
+	 * http://golang.org/src/pkg/net/net.go
+	 * https://code.google.com/p/go/issues/detail?id=4337
+	 * https://groups.google.com/forum/#!msg/golang-nuts/0_aaCvBmOcM/SptmDyX1XJMJ
+	 */
+	return strings.HasSuffix(err.Error(), "use of closed network connection")
+}
+
+func PartParser(template, data string) (map[string]string, error) {
+	// ip:public:private
+	templateParts := strings.Split(template, ":")
+	parts := strings.Split(data, ":")
+	if len(parts) != len(templateParts) {
+		return nil, fmt.Errorf("Invalid format to parse.  %s should match template %s", data, template)
+	}
+	out := make(map[string]string, len(templateParts))
+
+	for i, t := range templateParts {
+		value := ""
+		if len(parts) > i {
+			value = parts[i]
+		}
+		out[t] = value
+	}
+	return out, nil
 }

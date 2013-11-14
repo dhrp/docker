@@ -1,11 +1,14 @@
 package docker
 
 import (
+	"fmt"
+	"github.com/dotcloud/docker/engine"
 	"github.com/dotcloud/docker/utils"
 	"io"
 	"io/ioutil"
 	"os"
 	"path"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -14,40 +17,101 @@ import (
 // It has to be named XXX_test.go, apparently, in other to access private functions
 // from other XXX_test.go functions.
 
+var globalTestID string
+
 // Create a temporary runtime suitable for unit testing.
 // Call t.Fatal() at the first error.
-func mkRuntime(f Fataler) *Runtime {
-	runtime, err := newTestRuntime()
+func mkRuntime(f utils.Fataler) *Runtime {
+	root, err := newTestDirectory(unitTestStoreBase)
 	if err != nil {
 		f.Fatal(err)
 	}
-	return runtime
+	config := &DaemonConfig{
+		Root:        root,
+		AutoRestart: false,
+	}
+	r, err := NewRuntimeFromDirectory(config)
+	if err != nil {
+		f.Fatal(err)
+	}
+	r.UpdateCapabilities(true)
+	return r
 }
 
-// A common interface to access the Fatal method of
-// both testing.B and testing.T.
-type Fataler interface {
-	Fatal(args ...interface{})
+func createNamedTestContainer(eng *engine.Engine, config *Config, f utils.Fataler, name string) (shortId string) {
+	job := eng.Job("create", name)
+	if err := job.ImportEnv(config); err != nil {
+		f.Fatal(err)
+	}
+	job.StdoutParseString(&shortId)
+	if err := job.Run(); err != nil {
+		f.Fatal(err)
+	}
+	return
 }
 
-func newTestRuntime() (*Runtime, error) {
-	root, err := ioutil.TempDir("", "docker-test")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Remove(root); err != nil {
-		return nil, err
-	}
-	if err := utils.CopyDirectory(unitTestStoreBase, root); err != nil {
-		return nil, err
-	}
+func createTestContainer(eng *engine.Engine, config *Config, f utils.Fataler) (shortId string) {
+	return createNamedTestContainer(eng, config, f, "")
+}
 
-	runtime, err := NewRuntimeFromDirectory(root, false)
-	if err != nil {
-		return nil, err
+func mkServerFromEngine(eng *engine.Engine, t utils.Fataler) *Server {
+	iSrv := eng.Hack_GetGlobalVar("httpapi.server")
+	if iSrv == nil {
+		panic("Legacy server field not set in engine")
 	}
-	runtime.UpdateCapabilities(true)
-	return runtime, nil
+	srv, ok := iSrv.(*Server)
+	if !ok {
+		panic("Legacy server field in engine does not cast to *Server")
+	}
+	return srv
+}
+
+func NewTestEngine(t utils.Fataler) *engine.Engine {
+	root, err := newTestDirectory(unitTestStoreBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Load default plugins
+	// (This is manually copied and modified from main() until we have a more generic plugin system)
+	job := eng.Job("initapi")
+	job.Setenv("Root", root)
+	job.SetenvBool("AutoRestart", false)
+	if err := job.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return eng
+}
+
+func newTestDirectory(templateDir string) (dir string, err error) {
+	if globalTestID == "" {
+		globalTestID = GenerateID()[:4]
+	}
+	prefix := fmt.Sprintf("docker-test%s-%s-", globalTestID, getCallerName(2))
+	if prefix == "" {
+		prefix = "docker-test-"
+	}
+	dir, err = ioutil.TempDir("", prefix)
+	if err = os.Remove(dir); err != nil {
+		return
+	}
+	if err = utils.CopyDirectory(templateDir, dir); err != nil {
+		return
+	}
+	return
+}
+
+func getCallerName(depth int) string {
+	// Use the caller function name as a prefix.
+	// This helps trace temp directories back to their test.
+	pc, _, _, _ := runtime.Caller(depth + 1)
+	callerLongName := runtime.FuncForPC(pc).Name()
+	parts := strings.Split(callerLongName, ".")
+	callerShortName := parts[len(parts)-1]
+	return callerShortName
 }
 
 // Write `content` to the file at path `dst`, creating it if necessary,
@@ -88,7 +152,7 @@ func readFile(src string, t *testing.T) (content string) {
 // dynamically replaced by the current test image.
 // The caller is responsible for destroying the container.
 // Call t.Fatal() at the first error.
-func mkContainer(r *Runtime, args []string, t *testing.T) (*Container, *HostConfig, error) {
+func mkContainer(r *Runtime, args []string, t *testing.T) (*Container, error) {
 	config, hostConfig, _, err := ParseRun(args, nil)
 	defer func() {
 		if err != nil && t != nil {
@@ -96,16 +160,17 @@ func mkContainer(r *Runtime, args []string, t *testing.T) (*Container, *HostConf
 		}
 	}()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if config.Image == "_" {
 		config.Image = GetTestImage(r).ID
 	}
-	c, err := NewBuilder(r).Create(config)
+	c, _, err := r.Create(config, "")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return c, hostConfig, nil
+	c.hostConfig = hostConfig
+	return c, nil
 }
 
 // Create a test container, start it, wait for it to complete, destroy it,
@@ -118,7 +183,7 @@ func runContainer(r *Runtime, args []string, t *testing.T) (output string, err e
 			t.Fatal(err)
 		}
 	}()
-	container, hostConfig, err := mkContainer(r, args, t)
+	container, err := mkContainer(r, args, t)
 	if err != nil {
 		return "", err
 	}
@@ -128,7 +193,7 @@ func runContainer(r *Runtime, args []string, t *testing.T) (output string, err e
 		return "", err
 	}
 	defer stdout.Close()
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		return "", err
 	}
 	container.Wait()
@@ -218,7 +283,9 @@ func TestMergeConfig(t *testing.T) {
 		Volumes:   volumesUser,
 	}
 
-	MergeConfig(configUser, configImage)
+	if err := MergeConfig(configUser, configImage); err != nil {
+		t.Error(err)
+	}
 
 	if len(configUser.Dns) != 3 {
 		t.Fatalf("Expected 3 dns, 1.1.1.1, 2.2.2.2 and 3.3.3.3, found %d", len(configUser.Dns))
@@ -229,12 +296,12 @@ func TestMergeConfig(t *testing.T) {
 		}
 	}
 
-	if len(configUser.PortSpecs) != 3 {
-		t.Fatalf("Expected 3 portSpecs, 1111:1111, 3333:2222 and 3333:3333, found %d", len(configUser.PortSpecs))
+	if len(configUser.ExposedPorts) != 3 {
+		t.Fatalf("Expected 3 ExposedPorts, 1111, 2222 and 3333, found %d", len(configUser.ExposedPorts))
 	}
-	for _, portSpecs := range configUser.PortSpecs {
-		if portSpecs != "1111:1111" && portSpecs != "3333:2222" && portSpecs != "3333:3333" {
-			t.Fatalf("Expected 1111:1111 or 3333:2222 or 3333:3333, found %s", portSpecs)
+	for portSpecs := range configUser.ExposedPorts {
+		if portSpecs.Port() != "1111" && portSpecs.Port() != "2222" && portSpecs.Port() != "3333" {
+			t.Fatalf("Expected 1111 or 2222 or 3333, found %s", portSpecs)
 		}
 	}
 	if len(configUser.Env) != 3 {
@@ -258,48 +325,28 @@ func TestMergeConfig(t *testing.T) {
 	if configUser.VolumesFrom != "1111" {
 		t.Fatalf("Expected VolumesFrom to be 1111, found %s", configUser.VolumesFrom)
 	}
-}
 
-func TestMergeConfigPublicPortNotHonored(t *testing.T) {
-	volumesImage := make(map[string]struct{})
-	volumesImage["/test1"] = struct{}{}
-	volumesImage["/test2"] = struct{}{}
-	configImage := &Config{
-		Dns:       []string{"1.1.1.1", "2.2.2.2"},
-		PortSpecs: []string{"1111", "2222"},
-		Env:       []string{"VAR1=1", "VAR2=2"},
-		Volumes:   volumesImage,
+	ports, _, err := parsePortSpecs([]string{"0000"})
+	if err != nil {
+		t.Error(err)
+	}
+	configImage2 := &Config{
+		ExposedPorts: ports,
 	}
 
-	volumesUser := make(map[string]struct{})
-	volumesUser["/test3"] = struct{}{}
-	configUser := &Config{
-		Dns:       []string{"3.3.3.3"},
-		PortSpecs: []string{"1111:3333"},
-		Env:       []string{"VAR2=3", "VAR3=3"},
-		Volumes:   volumesUser,
+	if err := MergeConfig(configUser, configImage2); err != nil {
+		t.Error(err)
 	}
 
-	MergeConfig(configUser, configImage)
-
-	contains := func(a []string, expect string) bool {
-		for _, p := range a {
-			if p == expect {
-				return true
-			}
+	if len(configUser.ExposedPorts) != 4 {
+		t.Fatalf("Expected 4 ExposedPorts, 0000, 1111, 2222 and 3333, found %d", len(configUser.ExposedPorts))
+	}
+	for portSpecs := range configUser.ExposedPorts {
+		if portSpecs.Port() != "0000" && portSpecs.Port() != "1111" && portSpecs.Port() != "2222" && portSpecs.Port() != "3333" {
+			t.Fatalf("Expected 0000 or 1111 or 2222 or 3333, found %s", portSpecs)
 		}
-		return false
 	}
 
-	if !contains(configUser.PortSpecs, "2222") {
-		t.Logf("Expected '2222' Ports: %v", configUser.PortSpecs)
-		t.Fail()
-	}
-
-	if !contains(configUser.PortSpecs, "1111:3333") {
-		t.Logf("Expected '1111:3333' Ports: %v", configUser.PortSpecs)
-		t.Fail()
-	}
 }
 
 func TestParseLxcConfOpt(t *testing.T) {
@@ -314,6 +361,132 @@ func TestParseLxcConfOpt(t *testing.T) {
 			t.Fail()
 		}
 		if v != "docker" {
+			t.Fail()
+		}
+	}
+}
+
+func TestParseNetworkOptsPrivateOnly(t *testing.T) {
+	ports, bindings, err := parsePortSpecs([]string{"192.168.1.100::80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ports) != 1 {
+		t.Logf("Expected 1 got %d", len(ports))
+		t.FailNow()
+	}
+	if len(bindings) != 1 {
+		t.Logf("Expected 1 got %d", len(bindings))
+		t.FailNow()
+	}
+	for k := range ports {
+		if k.Proto() != "tcp" {
+			t.Logf("Expected tcp got %s", k.Proto())
+			t.Fail()
+		}
+		if k.Port() != "80" {
+			t.Logf("Expected 80 got %s", k.Port())
+			t.Fail()
+		}
+		b, exists := bindings[k]
+		if !exists {
+			t.Log("Binding does not exist")
+			t.FailNow()
+		}
+		if len(b) != 1 {
+			t.Logf("Expected 1 got %d", len(b))
+			t.FailNow()
+		}
+		s := b[0]
+		if s.HostPort != "" {
+			t.Logf("Expected \"\" got %s", s.HostPort)
+			t.Fail()
+		}
+		if s.HostIp != "192.168.1.100" {
+			t.Fail()
+		}
+	}
+}
+
+func TestParseNetworkOptsPublic(t *testing.T) {
+	ports, bindings, err := parsePortSpecs([]string{"192.168.1.100:8080:80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ports) != 1 {
+		t.Logf("Expected 1 got %d", len(ports))
+		t.FailNow()
+	}
+	if len(bindings) != 1 {
+		t.Logf("Expected 1 got %d", len(bindings))
+		t.FailNow()
+	}
+	for k := range ports {
+		if k.Proto() != "tcp" {
+			t.Logf("Expected tcp got %s", k.Proto())
+			t.Fail()
+		}
+		if k.Port() != "80" {
+			t.Logf("Expected 80 got %s", k.Port())
+			t.Fail()
+		}
+		b, exists := bindings[k]
+		if !exists {
+			t.Log("Binding does not exist")
+			t.FailNow()
+		}
+		if len(b) != 1 {
+			t.Logf("Expected 1 got %d", len(b))
+			t.FailNow()
+		}
+		s := b[0]
+		if s.HostPort != "8080" {
+			t.Logf("Expected 8080 got %s", s.HostPort)
+			t.Fail()
+		}
+		if s.HostIp != "192.168.1.100" {
+			t.Fail()
+		}
+	}
+}
+
+func TestParseNetworkOptsUdp(t *testing.T) {
+	ports, bindings, err := parsePortSpecs([]string{"192.168.1.100::6000/udp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ports) != 1 {
+		t.Logf("Expected 1 got %d", len(ports))
+		t.FailNow()
+	}
+	if len(bindings) != 1 {
+		t.Logf("Expected 1 got %d", len(bindings))
+		t.FailNow()
+	}
+	for k := range ports {
+		if k.Proto() != "udp" {
+			t.Logf("Expected udp got %s", k.Proto())
+			t.Fail()
+		}
+		if k.Port() != "6000" {
+			t.Logf("Expected 6000 got %s", k.Port())
+			t.Fail()
+		}
+		b, exists := bindings[k]
+		if !exists {
+			t.Log("Binding does not exist")
+			t.FailNow()
+		}
+		if len(b) != 1 {
+			t.Logf("Expected 1 got %d", len(b))
+			t.FailNow()
+		}
+		s := b[0]
+		if s.HostPort != "" {
+			t.Logf("Expected \"\" got %s", s.HostPort)
+			t.Fail()
+		}
+		if s.HostIp != "192.168.1.100" {
 			t.Fail()
 		}
 	}

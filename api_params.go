@@ -1,19 +1,51 @@
 package docker
 
+import "strings"
+
 type APIHistory struct {
 	ID        string   `json:"Id"`
 	Tags      []string `json:",omitempty"`
 	Created   int64
 	CreatedBy string `json:",omitempty"`
+	Size      int64
 }
 
 type APIImages struct {
+	ID          string   `json:"Id"`
+	RepoTags    []string `json:",omitempty"`
+	Created     int64
+	Size        int64
+	VirtualSize int64
+	ParentId    string `json:",omitempty"`
+}
+
+type APIImagesOld struct {
 	Repository  string `json:",omitempty"`
 	Tag         string `json:",omitempty"`
 	ID          string `json:"Id"`
 	Created     int64
 	Size        int64
 	VirtualSize int64
+}
+
+func (self *APIImages) ToLegacy() []APIImagesOld {
+
+	outs := []APIImagesOld{}
+	for _, repotag := range self.RepoTags {
+
+		components := strings.SplitN(repotag, ":", 2)
+
+		outs = append(outs, APIImagesOld{
+			ID:          self.ID,
+			Repository:  components[0],
+			Tag:         components[1],
+			Created:     self.Created,
+			Size:        self.Size,
+			VirtualSize: self.VirtualSize,
+		})
+	}
+
+	return outs
 }
 
 type APIInfo struct {
@@ -47,14 +79,34 @@ type APIContainers struct {
 	Command    string
 	Created    int64
 	Status     string
+	Ports      []APIPort
+	SizeRw     int64
+	SizeRootFs int64
+	Names      []string
+}
+
+func (self *APIContainers) ToLegacy() APIContainersOld {
+	return APIContainersOld{
+		ID:         self.ID,
+		Image:      self.Image,
+		Command:    self.Command,
+		Created:    self.Created,
+		Status:     self.Status,
+		Ports:      displayablePorts(self.Ports),
+		SizeRw:     self.SizeRw,
+		SizeRootFs: self.SizeRootFs,
+	}
+}
+
+type APIContainersOld struct {
+	ID         string `json:"Id"`
+	Image      string
+	Command    string
+	Created    int64
+	Status     string
 	Ports      string
 	SizeRw     int64
 	SizeRootFs int64
-}
-
-type APISearch struct {
-	Name        string
-	Description string
 }
 
 type APIID struct {
@@ -67,7 +119,10 @@ type APIRun struct {
 }
 
 type APIPort struct {
-	Port string
+	PrivatePort int64
+	PublicPort  int64
+	Type        string
+	IP          string
 }
 
 type APIVersion struct {

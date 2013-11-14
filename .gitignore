@@ -14,3 +14,8 @@ docs/_templates
 .gopath/
 .dotcloud
 *.test
+bundles/
+.hg/
+.git/
+vendor/pkg/
+pyenv

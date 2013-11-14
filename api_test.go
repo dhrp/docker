@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"github.com/dotcloud/docker/utils"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +39,25 @@ func TestGetBoolParam(t *testing.T) {
 	}
 	if ret, err := getBoolParam("faux"); err == nil || ret {
 		t.Fatalf("faux -> false, err | got %t %s", ret, err)
+	}
+}
+
+func TesthttpError(t *testing.T) {
+	r := httptest.NewRecorder()
+
+	httpError(r, fmt.Errorf("No such method"))
+	if r.Code != http.StatusNotFound {
+		t.Fatalf("Expected %d, got %d", http.StatusNotFound, r.Code)
+	}
+
+	httpError(r, fmt.Errorf("This accound hasn't been activated"))
+	if r.Code != http.StatusForbidden {
+		t.Fatalf("Expected %d, got %d", http.StatusForbidden, r.Code)
+	}
+
+	httpError(r, fmt.Errorf("Some error"))
+	if r.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected %d, got %d", http.StatusInternalServerError, r.Code)
 	}
 }
 
@@ -68,7 +89,7 @@ func TestGetInfo(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	initialImages, err := srv.runtime.graph.All()
+	initialImages, err := srv.runtime.graph.Map()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +112,7 @@ func TestGetInfo(t *testing.T) {
 
 func TestGetEvents(t *testing.T) {
 	runtime := mkRuntime(t)
+	defer nuke(runtime)
 	srv := &Server{
 		runtime:   runtime,
 		events:    make([]utils.JSONMessage, 0, 64),
@@ -162,7 +184,7 @@ func TestGetImagesJSON(t *testing.T) {
 
 	found := false
 	for _, img := range images {
-		if img.Repository == unitTestImageName {
+		if strings.Contains(img.RepoTags[0], unitTestImageName) {
 			found = true
 			break
 		}
@@ -243,34 +265,13 @@ func TestGetImagesJSON(t *testing.T) {
 		t.Fatalf("Error expected, received none")
 	}
 
-	httpError(r4, err)
+	if !strings.HasPrefix(err.Error(), "Bad parameter") {
+		t.Fatalf("Error should starts with \"Bad parameter\"")
+	}
+	http.Error(r4, err.Error(), http.StatusBadRequest)
+
 	if r4.Code != http.StatusBadRequest {
 		t.Fatalf("%d Bad Request expected, received %d\n", http.StatusBadRequest, r4.Code)
-	}
-}
-
-func TestGetImagesViz(t *testing.T) {
-	runtime := mkRuntime(t)
-	defer nuke(runtime)
-
-	srv := &Server{runtime: runtime}
-
-	r := httptest.NewRecorder()
-	if err := getImagesViz(srv, APIVERSION, r, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	if r.Code != http.StatusOK {
-		t.Fatalf("%d OK expected, received %d\n", http.StatusOK, r.Code)
-	}
-
-	reader := bufio.NewReader(r.Body)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatal(err)
-	}
-	if line != "digraph docker {\n" {
-		t.Errorf("Expected digraph docker {\n, %s found", line)
 	}
 }
 
@@ -321,10 +322,12 @@ func TestGetContainersJSON(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(&Config{
+	beginLen := runtime.containers.Len()
+
+	container, _, err := runtime.Create(&Config{
 		Image: GetTestImage(runtime).ID,
 		Cmd:   []string{"echo", "test"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,8 +346,8 @@ func TestGetContainersJSON(t *testing.T) {
 	if err := json.Unmarshal(r.Body.Bytes(), &containers); err != nil {
 		t.Fatal(err)
 	}
-	if len(containers) != 1 {
-		t.Fatalf("Expected %d container, %d found", 1, len(containers))
+	if len(containers) != beginLen+1 {
+		t.Fatalf("Expected %d container, %d found (started with: %d)", beginLen+1, len(containers), beginLen)
 	}
 	if containers[0].ID != container.ID {
 		t.Fatalf("Container ID mismatch. Expected: %s, received: %s\n", container.ID, containers[0].ID)
@@ -357,14 +360,13 @@ func TestGetContainersExport(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	builder := NewBuilder(runtime)
-
 	// Create a container and remove a file
-	container, err := builder.Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image: GetTestImage(runtime).ID,
 			Cmd:   []string{"touch", "/test"},
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -409,14 +411,13 @@ func TestGetContainersChanges(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	builder := NewBuilder(runtime)
-
 	// Create a container and remove a file
-	container, err := builder.Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image: GetTestImage(runtime).ID,
 			Cmd:   []string{"/bin/rm", "/etc/passwd"},
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -449,22 +450,19 @@ func TestGetContainersChanges(t *testing.T) {
 }
 
 func TestGetContainersTop(t *testing.T) {
-	runtime, err := newTestRuntime()
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Skip("Fixme. Skipping test for now. Reported error when testing using dind: 'api_test.go:527: Expected 2 processes, found 0.'")
+	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
 	srv := &Server{runtime: runtime}
 
-	builder := NewBuilder(runtime)
-
-	container, err := builder.Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image:     GetTestImage(runtime).ID,
 			Cmd:       []string{"/bin/sh", "-c", "cat"},
 			OpenStdin: true,
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -476,8 +474,7 @@ func TestGetContainersTop(t *testing.T) {
 		container.WaitTimeout(2 * time.Second)
 	}()
 
-	hostConfig := &HostConfig{}
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -540,14 +537,13 @@ func TestGetContainersByName(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	builder := NewBuilder(runtime)
-
 	// Create a container and remove a file
-	container, err := builder.Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image: GetTestImage(runtime).ID,
 			Cmd:   []string{"echo", "test"},
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -573,14 +569,13 @@ func TestPostCommit(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	builder := NewBuilder(runtime)
-
 	// Create a container and remove a file
-	container, err := builder.Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image: GetTestImage(runtime).ID,
 			Cmd:   []string{"touch", "/test"},
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -614,10 +609,10 @@ func TestPostCommit(t *testing.T) {
 }
 
 func TestPostContainersCreate(t *testing.T) {
-	runtime := mkRuntime(t)
+	eng := NewTestEngine(t)
+	srv := mkServerFromEngine(eng, t)
+	runtime := srv.runtime
 	defer nuke(runtime)
-
-	srv := &Server{runtime: runtime}
 
 	configJSON, err := json.Marshal(&Config{
 		Image:  GetTestImage(runtime).ID,
@@ -670,20 +665,20 @@ func TestPostContainersKill(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image:     GetTestImage(runtime).ID,
 			Cmd:       []string{"/bin/cat"},
 			OpenStdin: true,
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.Destroy(container)
 
-	hostConfig := &HostConfig{}
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -712,20 +707,20 @@ func TestPostContainersRestart(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image:     GetTestImage(runtime).ID,
-			Cmd:       []string{"/bin/cat"},
+			Cmd:       []string{"/bin/top"},
 			OpenStdin: true,
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.Destroy(container)
 
-	hostConfig := &HostConfig{}
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -761,47 +756,50 @@ func TestPostContainersRestart(t *testing.T) {
 }
 
 func TestPostContainersStart(t *testing.T) {
-	runtime := mkRuntime(t)
+	eng := NewTestEngine(t)
+	srv := mkServerFromEngine(eng, t)
+	runtime := srv.runtime
 	defer nuke(runtime)
 
-	srv := &Server{runtime: runtime}
-
-	container, err := NewBuilder(runtime).Create(
+	id := createTestContainer(
+		eng,
 		&Config{
 			Image:     GetTestImage(runtime).ID,
 			Cmd:       []string{"/bin/cat"},
 			OpenStdin: true,
 		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer runtime.Destroy(container)
+		t)
 
 	hostConfigJSON, err := json.Marshal(&HostConfig{})
 
-	req, err := http.NewRequest("POST", "/containers/"+container.ID+"/start", bytes.NewReader(hostConfigJSON))
+	req, err := http.NewRequest("POST", "/containers/"+id+"/start", bytes.NewReader(hostConfigJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	req.Header.Set("Content-Type", "application/json")
+
 	r := httptest.NewRecorder()
-	if err := postContainersStart(srv, APIVERSION, r, req, map[string]string{"name": container.ID}); err != nil {
+	if err := postContainersStart(srv, APIVERSION, r, req, map[string]string{"name": id}); err != nil {
 		t.Fatal(err)
 	}
 	if r.Code != http.StatusNoContent {
 		t.Fatalf("%d NO CONTENT expected, received %d\n", http.StatusNoContent, r.Code)
 	}
 
+	container := runtime.Get(id)
+	if container == nil {
+		t.Fatalf("Container %s was not created", id)
+	}
 	// Give some time to the process to start
+	// FIXME: use Wait once it's available as a job
 	container.WaitTimeout(500 * time.Millisecond)
-
 	if !container.State.Running {
 		t.Errorf("Container should be running")
 	}
 
 	r = httptest.NewRecorder()
-	if err = postContainersStart(srv, APIVERSION, r, req, map[string]string{"name": container.ID}); err == nil {
+	if err = postContainersStart(srv, APIVERSION, r, req, map[string]string{"name": id}); err == nil {
 		t.Fatalf("A running container should be able to be started")
 	}
 
@@ -816,20 +814,20 @@ func TestPostContainersStop(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image:     GetTestImage(runtime).ID,
-			Cmd:       []string{"/bin/cat"},
+			Cmd:       []string{"/bin/top"},
 			OpenStdin: true,
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.Destroy(container)
 
-	hostConfig := &HostConfig{}
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -863,20 +861,20 @@ func TestPostContainersWait(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image:     GetTestImage(runtime).ID,
 			Cmd:       []string{"/bin/sleep", "1"},
 			OpenStdin: true,
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.Destroy(container)
 
-	hostConfig := &HostConfig{}
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -905,12 +903,13 @@ func TestPostContainersAttach(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image:     GetTestImage(runtime).ID,
 			Cmd:       []string{"/bin/cat"},
 			OpenStdin: true,
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -918,8 +917,7 @@ func TestPostContainersAttach(t *testing.T) {
 	defer runtime.Destroy(container)
 
 	// Start the process
-	hostConfig := &HostConfig{}
-	if err := container.Start(hostConfig); err != nil {
+	if err := container.Start(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -960,7 +958,96 @@ func TestPostContainersAttach(t *testing.T) {
 	})
 
 	setTimeout(t, "read/write assertion timed out", 2*time.Second, func() {
-		if err := assertPipe("hello\n", "hello", stdout, stdinPipe, 15); err != nil {
+		if err := assertPipe("hello\n", string([]byte{1, 0, 0, 0, 0, 0, 0, 6})+"hello", stdout, stdinPipe, 15); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Close pipes (client disconnects)
+	if err := closeWrap(stdin, stdinPipe, stdout, stdoutPipe); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for attach to finish, the client disconnected, therefore, Attach finished his job
+	setTimeout(t, "Waiting for CmdAttach timed out", 10*time.Second, func() {
+		<-c1
+	})
+
+	// We closed stdin, expect /bin/cat to still be running
+	// Wait a little bit to make sure container.monitor() did his thing
+	err = container.WaitTimeout(500 * time.Millisecond)
+	if err == nil || !container.State.Running {
+		t.Fatalf("/bin/cat is not running after closing stdin")
+	}
+
+	// Try to avoid the timeout in destroy. Best effort, don't check error
+	cStdin, _ := container.StdinPipe()
+	cStdin.Close()
+	container.Wait()
+}
+
+func TestPostContainersAttachStderr(t *testing.T) {
+	runtime := mkRuntime(t)
+	defer nuke(runtime)
+
+	srv := &Server{runtime: runtime}
+
+	container, _, err := runtime.Create(
+		&Config{
+			Image:     GetTestImage(runtime).ID,
+			Cmd:       []string{"/bin/sh", "-c", "/bin/cat >&2"},
+			OpenStdin: true,
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Destroy(container)
+
+	// Start the process
+	if err := container.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdin, stdinPipe := io.Pipe()
+	stdout, stdoutPipe := io.Pipe()
+
+	// Try to avoid the timeout in destroy. Best effort, don't check error
+	defer func() {
+		closeWrap(stdin, stdinPipe, stdout, stdoutPipe)
+		container.Kill()
+	}()
+
+	// Attach to it
+	c1 := make(chan struct{})
+	go func() {
+		defer close(c1)
+
+		r := &hijackTester{
+			ResponseRecorder: httptest.NewRecorder(),
+			in:               stdin,
+			out:              stdoutPipe,
+		}
+
+		req, err := http.NewRequest("POST", "/containers/"+container.ID+"/attach?stream=1&stdin=1&stdout=1&stderr=1", bytes.NewReader([]byte{}))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := postContainersAttach(srv, APIVERSION, r, req, map[string]string{"name": container.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// Acknowledge hijack
+	setTimeout(t, "hijack acknowledge timed out", 2*time.Second, func() {
+		stdout.Read([]byte{})
+		stdout.Read(make([]byte, 4096))
+	})
+
+	setTimeout(t, "read/write assertion timed out", 2*time.Second, func() {
+		if err := assertPipe("hello\n", string([]byte{2, 0, 0, 0, 0, 0, 0, 6})+"hello", stdout, stdinPipe, 15); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -997,10 +1084,10 @@ func TestDeleteContainers(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	container, err := NewBuilder(runtime).Create(&Config{
+	container, _, err := runtime.Create(&Config{
 		Image: GetTestImage(runtime).ID,
 		Cmd:   []string{"touch", "/test"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1035,7 +1122,8 @@ func TestOptionsRoute(t *testing.T) {
 	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
-	srv := &Server{runtime: runtime, enableCors: true}
+	runtime.config.EnableCors = true
+	srv := &Server{runtime: runtime}
 
 	r := httptest.NewRecorder()
 	router, err := createRouter(srv, false)
@@ -1058,7 +1146,8 @@ func TestGetEnabledCors(t *testing.T) {
 	runtime := mkRuntime(t)
 	defer nuke(runtime)
 
-	srv := &Server{runtime: runtime, enableCors: true}
+	runtime.config.EnableCors = true
+	srv := &Server{runtime: runtime}
 
 	r := httptest.NewRecorder()
 
@@ -1112,7 +1201,7 @@ func TestDeleteImages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(images) != len(initialImages)+1 {
+	if len(images[0].RepoTags) != len(initialImages[0].RepoTags)+1 {
 		t.Errorf("Expected %d images, %d found", len(initialImages)+1, len(images))
 	}
 
@@ -1151,7 +1240,7 @@ func TestDeleteImages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(images) != len(initialImages) {
+	if len(images[0].RepoTags) != len(initialImages[0].RepoTags) {
 		t.Errorf("Expected %d image, %d found", len(initialImages), len(images))
 	}
 
@@ -1184,14 +1273,13 @@ func TestPostContainersCopy(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-	builder := NewBuilder(runtime)
-
 	// Create a container and remove a file
-	container, err := builder.Create(
+	container, _, err := runtime.Create(
 		&Config{
 			Image: GetTestImage(runtime).ID,
 			Cmd:   []string{"touch", "/test.txt"},
 		},
+		"",
 	)
 	if err != nil {
 		t.Fatal(err)

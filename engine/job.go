@@ -205,8 +205,12 @@ func (job *Job) SetenvInt(key string, value int64) {
 	job.Setenv(key, fmt.Sprintf("%d", value))
 }
 
+// Returns nil if key not found
 func (job *Job) GetenvList(key string) []string {
 	sval := job.Getenv(key)
+	if sval == "" {
+		return nil
+	}
 	l := make([]string, 0, 1)
 	if err := json.Unmarshal([]byte(sval), &l); err != nil {
 		l = append(l, sval)
@@ -214,13 +218,17 @@ func (job *Job) GetenvList(key string) []string {
 	return l
 }
 
-func (job *Job) SetenvList(key string, value []string) error {
+func (job *Job) SetenvJson(key string, value interface{}) error {
 	sval, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 	job.Setenv(key, string(sval))
 	return nil
+}
+
+func (job *Job) SetenvList(key string, value []string) error {
+	return job.SetenvJson(key, value)
 }
 
 func (job *Job) Setenv(key, value string) {
@@ -230,7 +238,7 @@ func (job *Job) Setenv(key, value string) {
 // DecodeEnv decodes `src` as a json dictionary, and adds
 // each decoded key-value pair to the environment.
 //
-// If `text` cannot be decoded as a json dictionary, an error
+// If `src` cannot be decoded as a json dictionary, an error
 // is returned.
 func (job *Job) DecodeEnv(src io.Reader) error {
 	m := make(map[string]interface{})

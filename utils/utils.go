@@ -270,13 +270,14 @@ func isValidDockerInitPath(target string, selfPath string) bool { // target and 
 }
 
 // Figure out the path of our dockerinit (which may be SelfPath())
-func DockerInitPath() string {
+func DockerInitPath(localCopy string) string {
 	selfPath := SelfPath()
 	if isValidDockerInitPath(selfPath, selfPath) {
 		// if we're valid, don't bother checking anything else
 		return selfPath
 	}
 	var possibleInits = []string{
+		localCopy,
 		filepath.Join(filepath.Dir(selfPath), "dockerinit"),
 		// "/usr/libexec includes internal binaries that are not intended to be executed directly by users or shell scripts. Applications may use a single subdirectory under /usr/libexec."
 		"/usr/libexec/docker/dockerinit",
@@ -411,7 +412,7 @@ func (w *WriteBroadcaster) Write(p []byte) (n int, err error) {
 					w.buf.Write([]byte(line))
 					break
 				}
-				b, err := json.Marshal(&JSONLog{Log: line, Stream: sw.stream, Created: time.Now()})
+				b, err := json.Marshal(&JSONLog{Log: line, Stream: sw.stream, Created: time.Now().UTC()})
 				if err != nil {
 					// On error, evict the writer
 					delete(w.writers, sw)
@@ -779,14 +780,19 @@ func NewHTTPRequestError(msg string, res *http.Response) error {
 	}
 }
 
-func (jm *JSONMessage) Display(out io.Writer) error {
+func (jm *JSONMessage) Display(out io.Writer, isTerminal bool) error {
 	if jm.Error != nil {
 		if jm.Error.Code == 401 {
 			return fmt.Errorf("Authentication is required.")
 		}
 		return jm.Error
 	}
-	fmt.Fprintf(out, "%c[2K\r", 27)
+	endl := ""
+	if isTerminal {
+		// <ESC>[2K = erase entire current line
+		fmt.Fprintf(out, "%c[2K\r", 27)
+		endl = "\r"
+	}
 	if jm.Time != 0 {
 		fmt.Fprintf(out, "[%s] ", time.Unix(jm.Time, 0))
 	}
@@ -797,14 +803,14 @@ func (jm *JSONMessage) Display(out io.Writer) error {
 		fmt.Fprintf(out, "(from %s) ", jm.From)
 	}
 	if jm.Progress != "" {
-		fmt.Fprintf(out, "%s %s\r", jm.Status, jm.Progress)
+		fmt.Fprintf(out, "%s %s%s", jm.Status, jm.Progress, endl)
 	} else {
-		fmt.Fprintf(out, "%s\r\n", jm.Status)
+		fmt.Fprintf(out, "%s%s\n", jm.Status, endl)
 	}
 	return nil
 }
 
-func DisplayJSONMessagesStream(in io.Reader, out io.Writer) error {
+func DisplayJSONMessagesStream(in io.Reader, out io.Writer, isTerminal bool) error {
 	dec := json.NewDecoder(in)
 	ids := make(map[string]int)
 	diff := 0
@@ -825,11 +831,17 @@ func DisplayJSONMessagesStream(in io.Reader, out io.Writer) error {
 			} else {
 				diff = len(ids) - line
 			}
-			fmt.Fprintf(out, "%c[%dA", 27, diff)
+			if isTerminal {
+				// <ESC>[{diff}A = move cursor up diff rows
+				fmt.Fprintf(out, "%c[%dA", 27, diff)
+			}
 		}
-		err := jm.Display(out)
+		err := jm.Display(out, isTerminal)
 		if jm.ID != "" {
-			fmt.Fprintf(out, "%c[%dB", 27, diff)
+			if isTerminal {
+				// <ESC>[{diff}B = move cursor down diff rows
+				fmt.Fprintf(out, "%c[%dB", 27, diff)
+			}
 		}
 		if err != nil {
 			return err
@@ -1123,7 +1135,7 @@ func (graph *DependencyGraph) GenerateTraversalMap() ([][]string, error) {
 	for len(processed) < len(graph.nodes) {
 		// Use a temporary buffer for processed nodes, otherwise
 		// nodes that depend on each other could end up in the same round.
-		tmp_processed := []*DependencyNode{}
+		tmpProcessed := []*DependencyNode{}
 		for _, node := range graph.nodes {
 			// If the node has more dependencies than what we have cleared,
 			// it won't be valid for this round.
@@ -1137,7 +1149,7 @@ func (graph *DependencyGraph) GenerateTraversalMap() ([][]string, error) {
 			// It's not been processed yet and has 0 deps. Add it!
 			// (this is a shortcut for what we're doing below)
 			if node.Degree() == 0 {
-				tmp_processed = append(tmp_processed, node)
+				tmpProcessed = append(tmpProcessed, node)
 				continue
 			}
 			// If at least one dep hasn't been processed yet, we can't
@@ -1151,17 +1163,17 @@ func (graph *DependencyGraph) GenerateTraversalMap() ([][]string, error) {
 			}
 			// All deps have already been processed. Add it!
 			if ok {
-				tmp_processed = append(tmp_processed, node)
+				tmpProcessed = append(tmpProcessed, node)
 			}
 		}
-		Debugf("Round %d: found %d available nodes", len(result), len(tmp_processed))
+		Debugf("Round %d: found %d available nodes", len(result), len(tmpProcessed))
 		// If no progress has been made this round,
 		// that means we have circular dependencies.
-		if len(tmp_processed) == 0 {
+		if len(tmpProcessed) == 0 {
 			return nil, fmt.Errorf("Could not find a solution to this dependency graph")
 		}
 		round := []string{}
-		for _, nd := range tmp_processed {
+		for _, nd := range tmpProcessed {
 			round = append(round, nd.id)
 			processed[nd] = true
 		}
@@ -1179,6 +1191,41 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("Status: %d", e.Status)
 }
 
+func quote(word string, buf *bytes.Buffer) {
+	// Bail out early for "simple" strings
+	if word != "" && !strings.ContainsAny(word, "\\'\"`${[|&;<>()~*?! \t\n") {
+		buf.WriteString(word)
+		return
+	}
+
+	buf.WriteString("'")
+
+	for i := 0; i < len(word); i++ {
+		b := word[i]
+		if b == '\'' {
+			// Replace literal ' with a close ', a \', and a open '
+			buf.WriteString("'\\''")
+		} else {
+			buf.WriteByte(b)
+		}
+	}
+
+	buf.WriteString("'")
+}
+
+// Take a list of strings and escape them so they will be handled right
+// when passed as arguments to an program via a shell
+func ShellQuoteArguments(args []string) string {
+	var buf bytes.Buffer
+	for i, arg := range args {
+		if i != 0 {
+			buf.WriteByte(' ')
+		}
+		quote(arg, &buf)
+	}
+	return buf.String()
+}
+
 func IsClosedError(err error) bool {
 	/* This comparison is ugly, but unfortunately, net.go doesn't export errClosing.
 	 * See:
@@ -1191,12 +1238,14 @@ func IsClosedError(err error) bool {
 
 func PartParser(template, data string) (map[string]string, error) {
 	// ip:public:private
-	templateParts := strings.Split(template, ":")
-	parts := strings.Split(data, ":")
+	var (
+		templateParts = strings.Split(template, ":")
+		parts         = strings.Split(data, ":")
+		out           = make(map[string]string, len(templateParts))
+	)
 	if len(parts) != len(templateParts) {
 		return nil, fmt.Errorf("Invalid format to parse.  %s should match template %s", data, template)
 	}
-	out := make(map[string]string, len(templateParts))
 
 	for i, t := range templateParts {
 		value := ""
@@ -1206,4 +1255,61 @@ func PartParser(template, data string) (map[string]string, error) {
 		out[t] = value
 	}
 	return out, nil
+}
+
+var globalTestID string
+
+// TestDirectory creates a new temporary directory and returns its path.
+// The contents of directory at path `templateDir` is copied into the
+// new directory.
+func TestDirectory(templateDir string) (dir string, err error) {
+	if globalTestID == "" {
+		globalTestID = RandomString()[:4]
+	}
+	prefix := fmt.Sprintf("docker-test%s-%s-", globalTestID, GetCallerName(2))
+	if prefix == "" {
+		prefix = "docker-test-"
+	}
+	dir, err = ioutil.TempDir("", prefix)
+	if err = os.Remove(dir); err != nil {
+		return
+	}
+	if templateDir != "" {
+		if err = CopyDirectory(templateDir, dir); err != nil {
+			return
+		}
+	}
+	return
+}
+
+// GetCallerName introspects the call stack and returns the name of the
+// function `depth` levels down in the stack.
+func GetCallerName(depth int) string {
+	// Use the caller function name as a prefix.
+	// This helps trace temp directories back to their test.
+	pc, _, _, _ := runtime.Caller(depth + 1)
+	callerLongName := runtime.FuncForPC(pc).Name()
+	parts := strings.Split(callerLongName, ".")
+	callerShortName := parts[len(parts)-1]
+	return callerShortName
+}
+
+func CopyFile(src, dst string) (int64, error) {
+	if src == dst {
+		return 0, nil
+	}
+	sf, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer sf.Close()
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	df, err := os.Create(dst)
+	if err != nil {
+		return 0, err
+	}
+	defer df.Close()
+	return io.Copy(df, sf)
 }

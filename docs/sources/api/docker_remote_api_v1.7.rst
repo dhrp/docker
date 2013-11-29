@@ -13,9 +13,12 @@ Docker Remote API v1.7
 1. Brief introduction
 =====================
 
-- The Remote API is replacing rcli
-- Default port in the docker daemon is 4243
-- The API tends to be REST, but for some complex commands, like attach or pull, the HTTP connection is hijacked to transport stdout stdin and stderr
+- The Remote API has replaced rcli
+- The daemon listens on ``unix:///var/run/docker.sock``, but you can
+  :ref:`bind_docker`.
+- The API tends to be REST, but for some complex commands, like
+  ``attach`` or ``pull``, the HTTP connection is hijacked to transport
+  ``stdout, stdin`` and ``stderr``
 
 2. Endpoints
 ============
@@ -690,8 +693,10 @@ Create an image
         :query repo: repository
 	:query tag: tag
 	:query registry: the registry to pull from
+	:reqheader X-Registry-Auth: base64-encoded AuthConfig object
         :statuscode 200: no error
         :statuscode 500: server error
+
 
 
 Insert a file in an image
@@ -835,18 +840,16 @@ Push an image on the registry
     HTTP/1.1 200 OK
     Content-Type: application/json
 
-   {"status":"Pushing..."}
-   {"status":"Pushing", "progress":"1/? (n/a)"}
-   {"error":"Invalid..."}
-   ...
-
-	The ``X-Registry-Auth`` header can be used to include a
-	base64-encoded AuthConfig object.
+    {"status":"Pushing..."}
+    {"status":"Pushing", "progress":"1/? (n/a)"}
+    {"error":"Invalid..."}
+    ...
 
    :query registry: the registry you wan to push, optional
+   :reqheader X-Registry-Auth: include a base64-encoded AuthConfig object.
    :statuscode 200: no error
-        :statuscode 404: no such image
-        :statuscode 500: server error
+   :statuscode 404: no such image
+   :statuscode 500: server error
 
 
 Tag an image into a repository
@@ -959,9 +962,9 @@ Search images
 	   ...
 	   ]
 
-	   :query term: term to search
-	   :statuscode 200: no error
-	   :statuscode 500: server error
+	:query term: term to search
+	:statuscode 200: no error
+	:statuscode 500: server error
 
 
 2.3 Misc
@@ -991,18 +994,22 @@ Build an image from Dockerfile via stdin
       {{ STREAM }}
 
 
-       The stream must be a tar archive compressed with one of the following algorithms:
-       identity (no compression), gzip, bzip2, xz. The archive must include a file called
-       `Dockerfile` at its root. It may include any number of other files, which will be
-       accessible in the build context (See the ADD build command).
+   The stream must be a tar archive compressed with one of the
+   following algorithms: identity (no compression), gzip, bzip2,
+   xz. 
 
-       The Content-type header should be set to "application/tar".
+   The archive must include a file called ``Dockerfile`` at its
+   root. It may include any number of other files, which will be
+   accessible in the build context (See the :ref:`ADD build command
+   <dockerbuilder>`).
 
-	:query t: repository name (and optionally a tag) to be applied to the resulting image in case of success
-	:query q: suppress verbose build output
-    :query nocache: do not use the cache when building the image
-	:statuscode 200: no error
-    :statuscode 500: server error
+   :query t: repository name (and optionally a tag) to be applied to the resulting image in case of success
+   :query q: suppress verbose build output
+   :query nocache: do not use the cache when building the image
+   :reqheader Content-type: should be set to ``"application/tar"``.
+   :statuscode 200: no error
+   :statuscode 500: server error
+
 
 
 Check auth configuration
@@ -1164,6 +1171,53 @@ Monitor Docker's events
         :statuscode 200: no error
         :statuscode 500: server error
 
+Get a tarball containing all images and tags in a repository
+************************************************************
+
+.. http:get:: /images/(name)/get
+
+  Get a tarball containing all images and metadata for the repository specified by ``name``.
+
+  **Example request**
+
+  .. sourcecode:: http
+  
+           GET /images/ubuntu/get
+
+       **Example response**:
+
+       .. sourcecode:: http
+
+          HTTP/1.1 200 OK
+    Content-Type: application/x-tar
+
+    Binary data stream
+        :statuscode 200: no error
+        :statuscode 500: server error
+
+Load a tarball with a set of images and tags into docker
+********************************************************
+
+.. http:post:: /images/load
+
+  Load a set of images and tags into the docker repository.
+
+  **Example request**
+
+  .. sourcecode:: http
+
+           POST /images/load
+
+         Tarball in body
+
+       **Example response**:
+
+       .. sourcecode:: http
+
+          HTTP/1.1 200 OK
+
+        :statuscode 200: no error
+        :statuscode 500: server error
 
 3. Going further
 ================

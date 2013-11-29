@@ -61,7 +61,10 @@ func parseMultipartForm(r *http.Request) error {
 
 func httpError(w http.ResponseWriter, err error) {
 	statusCode := http.StatusInternalServerError
-	if strings.HasPrefix(err.Error(), "No such") {
+	// FIXME: this is brittle and should not be necessary.
+	// If we need to differentiate between different possible error types, we should
+	// create appropriate error types with clearly defined meaning.
+	if strings.Contains(err.Error(), "No such") {
 		statusCode = http.StatusNotFound
 	} else if strings.HasPrefix(err.Error(), "Bad parameter") {
 		statusCode = http.StatusBadRequest
@@ -146,13 +149,12 @@ func postContainersKill(srv *Server, version float64, w http.ResponseWriter, r *
 
 	signal := 0
 	if r != nil {
-		s := r.Form.Get("signal")
-		if s != "" {
-			if s, err := strconv.Atoi(s); err != nil {
+		if s := r.Form.Get("signal"); s != "" {
+			s, err := strconv.Atoi(s)
+			if err != nil {
 				return err
-			} else {
-				signal = s
 			}
+			signal = s
 		}
 	}
 	if err := srv.ContainerKill(name, signal); err != nil {
@@ -198,9 +200,8 @@ func getImagesJSON(srv *Server, version float64, w http.ResponseWriter, r *http.
 		}
 
 		return writeJSON(w, http.StatusOK, outs2)
-	} else {
-		return writeJSON(w, http.StatusOK, outs)
 	}
+	return writeJSON(w, http.StatusOK, outs)
 }
 
 func getImagesViz(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
@@ -253,7 +254,7 @@ func getEvents(srv *Server, version float64, w http.ResponseWriter, r *http.Requ
 	wf.Flush()
 	if since != 0 {
 		// If since, send previous events that happened after the timestamp
-		for _, event := range srv.events {
+		for _, event := range srv.GetEvents() {
 			if event.Time >= since {
 				err := sendEvent(wf, &event)
 				if err != nil && err.Error() == "JSON error" {
@@ -313,13 +314,10 @@ func getContainersTop(srv *Server, version float64, w http.ResponseWriter, r *ht
 	if err := parseForm(r); err != nil {
 		return err
 	}
-	name := vars["name"]
-	ps_args := r.Form.Get("ps_args")
-	procsStr, err := srv.ContainerTop(name, ps_args)
+	procsStr, err := srv.ContainerTop(vars["name"], r.Form.Get("ps_args"))
 	if err != nil {
 		return err
 	}
-
 	return writeJSON(w, http.StatusOK, procsStr)
 }
 
@@ -347,13 +345,12 @@ func getContainersJSON(srv *Server, version float64, w http.ResponseWriter, r *h
 	if version < 1.5 {
 		outs2 := []APIContainersOld{}
 		for _, ctnr := range outs {
-			outs2 = append(outs2, ctnr.ToLegacy())
+			outs2 = append(outs2, *ctnr.ToLegacy())
 		}
 
 		return writeJSON(w, http.StatusOK, outs2)
-	} else {
-		return writeJSON(w, http.StatusOK, outs)
 	}
+	return writeJSON(w, http.StatusOK, outs)
 }
 
 func postImagesTag(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
@@ -537,6 +534,18 @@ func postImagesPush(srv *Server, version float64, w http.ResponseWriter, r *http
 	return nil
 }
 
+func getImagesGet(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	name := vars["name"]
+	if version > 1.0 {
+		w.Header().Set("Content-Type", "application/x-tar")
+	}
+	return srv.ImageExport(name, w)
+}
+
+func postImagesLoad(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	return srv.ImageLoad(r.Body)
+}
+
 func postContainersCreate(srv *Server, version float64, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := parseForm(r); err != nil {
 		return nil
@@ -637,12 +646,10 @@ func deleteImages(srv *Server, version float64, w http.ResponseWriter, r *http.R
 	if imgs != nil {
 		if len(imgs) != 0 {
 			return writeJSON(w, http.StatusOK, imgs)
-		} else {
-			return fmt.Errorf("Conflict, %s wasn't deleted", name)
 		}
-	} else {
-		w.WriteHeader(http.StatusNoContent)
+		return fmt.Errorf("Conflict, %s wasn't deleted", name)
 	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
 
@@ -652,9 +659,6 @@ func postContainersStart(srv *Server, version float64, w http.ResponseWriter, r 
 	}
 	name := vars["name"]
 	job := srv.Eng.Job("start", name)
-	if err := job.ImportEnv(HostConfig{}); err != nil {
-		return fmt.Errorf("Couldn't initialize host configuration")
-	}
 	// allow a nil body for backwards compatibility
 	if r.Body != nil {
 		if matchesContentType(r.Header.Get("Content-Type"), "application/json") {
@@ -927,7 +931,7 @@ func postBuild(srv *Server, version float64, w http.ResponseWriter, r *http.Requ
 		if err != nil {
 			return err
 		}
-		c, err := mkBuildContext(string(dockerFile), nil)
+		c, err := MkBuildContext(string(dockerFile), nil)
 		if err != nil {
 			return err
 		}
@@ -975,7 +979,7 @@ func postContainersCopy(srv *Server, version float64, w http.ResponseWriter, r *
 	}
 
 	if copyData.Resource == "" {
-		return fmt.Errorf("Resource cannot be empty")
+		return fmt.Errorf("Path cannot be empty")
 	}
 	if copyData.Resource[0] == '/' {
 		copyData.Resource = copyData.Resource[1:]
@@ -1044,6 +1048,7 @@ func createRouter(srv *Server, logging bool) (*mux.Router, error) {
 			"/images/json":                    getImagesJSON,
 			"/images/viz":                     getImagesViz,
 			"/images/search":                  getImagesSearch,
+			"/images/{name:.*}/get":           getImagesGet,
 			"/images/{name:.*}/history":       getImagesHistory,
 			"/images/{name:.*}/json":          getImagesByName,
 			"/containers/ps":                  getContainersJSON,
@@ -1060,6 +1065,7 @@ func createRouter(srv *Server, logging bool) (*mux.Router, error) {
 			"/build":                        postBuild,
 			"/images/create":                postImagesCreate,
 			"/images/{name:.*}/insert":      postImagesInsert,
+			"/images/load":                  postImagesLoad,
 			"/images/{name:.*}/push":        postImagesPush,
 			"/images/{name:.*}/tag":         postImagesTag,
 			"/containers/create":            postContainersCreate,
@@ -1103,6 +1109,20 @@ func createRouter(srv *Server, logging bool) (*mux.Router, error) {
 	}
 
 	return r, nil
+}
+
+// ServeRequest processes a single http request to the docker remote api.
+// FIXME: refactor this to be part of Server and not require re-creating a new
+// router each time. This requires first moving ListenAndServe into Server.
+func ServeRequest(srv *Server, apiversion float64, w http.ResponseWriter, req *http.Request) error {
+	router, err := createRouter(srv, false)
+	if err != nil {
+		return err
+	}
+	// Insert APIVERSION into the request as a convenience
+	req.URL.Path = fmt.Sprintf("/v%g%s", apiversion, req.URL.Path)
+	router.ServeHTTP(w, req)
+	return nil
 }
 
 func ListenAndServe(proto, addr string, srv *Server, logging bool) error {
